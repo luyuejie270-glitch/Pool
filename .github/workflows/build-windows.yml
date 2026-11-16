@@ -35,20 +35,14 @@ jobs:
         run: |
           python -m py_compile app.py core.py
 
-      - name: 下载 ffmpeg.exe（BtbN FFmpeg-Builds win64 gpl）
+      - name: 准备 ffmpeg.exe（用 pip 自带二进制，避免外部下载失效）
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = Join-Path $env:RUNNER_TEMP "ffmpeg.zip"
-          $dest = Join-Path $env:RUNNER_TEMP "ffmpeg"
-          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
-          Write-Host "下载 $url"
-          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-          Expand-Archive -Path $zip -DestinationPath $dest -Force
-          $exe = Get-ChildItem -Path $dest -Filter ffmpeg.exe -Recurse | Select-Object -First 1
-          if (-not $exe) { throw "压缩包里没有找到 ffmpeg.exe" }
-          Copy-Item $exe.FullName -Destination "ffmpeg.exe" -Force
-          Get-Item "ffmpeg.exe" | Select-Object FullName, Length
+          python -m pip install --quiet imageio-ffmpeg
+          python -c "import imageio_ffmpeg, shutil; shutil.copyfile(imageio_ffmpeg.get_ffmpeg_exe(), 'ffmpeg.exe')"
+          if (-not (Test-Path 'ffmpeg.exe')) { throw '没能得到 ffmpeg.exe' }
+          Get-Item ffmpeg.exe | Select-Object FullName, Length
 
       - name: 用 PyInstaller 打包
         run: >
