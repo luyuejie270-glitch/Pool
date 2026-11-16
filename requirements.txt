@@ -7,3 +7,5 @@ numpy>=1.26,<3
 
 # 仅用于 GitHub Actions 打包 Windows 可执行文件；本机源码运行不需要
 pyinstaller>=6.0
+
+pillow>=10.0      # 中文标注（覆盖图/热力图/曲线图的图例与标题）

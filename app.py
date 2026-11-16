@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""泳池机器人覆盖率分析 v0.2 —— Tkinter 桌面界面。
+"""泳池机器人覆盖率分析 v0.3 —— Tkinter 桌面界面。
 
 分析算法在 core.py（接口契约见 INTERFACE.md）。本模块遵守两条硬约束：
 
@@ -32,7 +32,7 @@ try:  # 缺少 core.py 时也允许 import 成功，main() 会给出中文提示
 except Exception:  # pragma: no cover - 仅在文件缺失/依赖损坏时触发
     core = None
 
-APP_TITLE = "泳池机器人覆盖率分析 v0.2"
+APP_TITLE = "泳池机器人覆盖率分析 v0.3"
 MIN_WINDOW_WIDTH = 900
 MIN_WINDOW_HEIGHT = 680
 
@@ -56,6 +56,8 @@ VIDEO_TYPES = [
     ("视频文件", "*.mp4 *.avi *.mov *.mkv *.wmv *.flv *.m4v *.mpg *.mpeg"),
     ("所有文件", "*.*"),
 ]
+# 起始时间：允许 HH:MM 或 HH:MM:SS（如 08:44:38）
+TIME_PATTERN = re.compile(r"^\d{1,2}:\d{1,2}(:\d{1,2})?$")
 
 
 # ============================================================ 通用小工具
@@ -872,7 +874,7 @@ class PoolCoverageApp:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
-        self.root.geometry("%dx%d" % (1040, 780))
+        self.root.geometry("%dx%d" % (1080, 860))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.reports_root = default_reports_root()
@@ -889,6 +891,8 @@ class PoolCoverageApp:
         self._history_records = []
         self._history_by_iid = {}
         self._templates = []
+        self._last_start_time = ""
+        self._last_speed = 1.0
 
         self._setup_fonts()
         self._build_ui()
@@ -1018,6 +1022,25 @@ class PoolCoverageApp:
         ttk.Label(param_box, text="0 = 保守（少误检）　1 = 灵敏（暗光/小机器人）",
                   style="Hint.TLabel").grid(row=1, column=0, columnspan=6, sticky="w",
                                             pady=(4, 0))
+
+        # ---- 3b. 真实时间参数（用于「覆盖率-真实时间」曲线）
+        ttk.Label(param_box, text="起始时间：").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.var_start_time = tk.StringVar(value="")
+        self.ent_start_time = ttk.Entry(param_box, textvariable=self.var_start_time,
+                                        width=13)
+        self.ent_start_time.grid(row=2, column=1, sticky="w", padx=(0, 18), pady=(6, 0))
+        ttk.Label(param_box,
+                  text="填监控画面第一帧的时间，如 08:44:38；留空则曲线横轴按相对时间。",
+                  style="Hint.TLabel").grid(row=2, column=2, columnspan=4, sticky="w",
+                                            pady=(6, 0))
+        ttk.Label(param_box, text="加速倍数：").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self.var_speed = tk.StringVar(value="1.0")
+        self.ent_speed = ttk.Entry(param_box, textvariable=self.var_speed, width=13)
+        self.ent_speed.grid(row=3, column=1, sticky="w", padx=(0, 18), pady=(4, 0))
+        ttk.Label(param_box,
+                  text="视频是加速的填倍速：2 小时压成 2 分钟填 60；原速填 1.0。",
+                  style="Hint.TLabel").grid(row=3, column=2, columnspan=4, sticky="w",
+                                            pady=(4, 0))
         row += 1
 
         # ---- 4. 开始/取消 + 进度
@@ -1068,21 +1091,44 @@ class PoolCoverageApp:
                                    state="disabled",
                                    command=lambda: self._open_result("overlay_path",
                                                                      "轨迹视频"))
-        self.btn_heatmap = ttk.Button(btn_frame, text="查看热力图", width=12,
-                                      state="disabled",
-                                      command=lambda: self._open_result("heatmap_path",
-                                                                        "热力图"))
         self.btn_summary = ttk.Button(btn_frame, text="打开 summary.json", width=17,
                                       state="disabled",
                                       command=lambda: self._open_result("summary_json",
                                                                         "summary.json"))
-        for index, btn in enumerate((self.btn_open_dir, self.btn_play,
-                                     self.btn_heatmap, self.btn_summary)):
+        for index, btn in enumerate((self.btn_open_dir, self.btn_play, self.btn_summary)):
+            btn.grid(row=0, column=index, padx=(0, 8))
+
+        # ---- 结果图片：覆盖图 / 热力图 / 覆盖率曲线 / 完整轨迹图
+        img_frame = ttk.Frame(result_box)
+        img_frame.grid(row=2, column=0, columnspan=8, sticky="w", pady=(6, 0))
+        self.btn_coverage = ttk.Button(img_frame, text="查看覆盖图", width=12,
+                                       state="disabled",
+                                       command=lambda: self._open_result("coverage_path",
+                                                                         "覆盖图"))
+        self.btn_heatmap = ttk.Button(img_frame, text="查看热力图", width=12,
+                                      state="disabled",
+                                      command=lambda: self._open_result("heatmap_path",
+                                                                        "热力图"))
+        self.btn_curve = ttk.Button(img_frame, text="查看覆盖率曲线", width=15,
+                                    state="disabled",
+                                    command=lambda: self._open_result("curve_path",
+                                                                      "覆盖率曲线"))
+        self.btn_trajectory_img = ttk.Button(img_frame, text="查看轨迹图", width=12,
+                                             state="disabled",
+                                             command=lambda: self._open_result(
+                                                 "trajectory_image_path", "轨迹图"))
+        for index, btn in enumerate((self.btn_coverage, self.btn_heatmap,
+                                     self.btn_curve, self.btn_trajectory_img)):
             btn.grid(row=0, column=index, padx=(0, 8))
 
         self.var_result_note = tk.StringVar(value="输出目录：%s" % self.reports_root)
         ttk.Label(result_box, textvariable=self.var_result_note, style="Hint.TLabel").grid(
-            row=2, column=0, columnspan=8, sticky="w", pady=(6, 0))
+            row=3, column=0, columnspan=8, sticky="w", pady=(6, 0))
+        ttk.Label(result_box,
+                  text="曲线图横轴：填了起始时间=真实时间，否则=相对时间；"
+                       "覆盖图 绿=已清洗 / 白=未清洗；"
+                       "热力图 白=未清洗、蓝/黄/红/黑=1/2/3/4 次以上。",
+                  style="Hint.TLabel").grid(row=4, column=0, columnspan=8, sticky="w")
         row += 1
 
         # ---- 6. 历史记录
@@ -1106,7 +1152,7 @@ class PoolCoverageApp:
 
         columns = ("time", "video", "coverage", "hit")
         self.tree = ttk.Treeview(history_box, columns=columns, show="headings",
-                                 selectmode="extended", height=5)
+                                 selectmode="extended", height=4)
         self.tree.heading("time", text="时间")
         self.tree.heading("video", text="视频")
         self.tree.heading("coverage", text="覆盖率")
@@ -1341,6 +1387,36 @@ class PoolCoverageApp:
             self._set_calibrated(dialog.result)
             self._set_status("标定完成，可以点击“开始分析”。")
 
+    # -------------------------------------------------- 真实时间参数校验
+    def _validated_start_time(self):
+        """返回 (start_time, ok)。空串表示按相对时间；非法时也给默认空串。"""
+        raw = self.var_start_time.get().strip().replace("：", ":")
+        if not raw:
+            return "", True
+        if not TIME_PATTERN.match(raw):
+            return "", False
+        parts = [int(p) for p in raw.split(":")]
+        if parts[0] > 23 or (len(parts) >= 2 and parts[1] > 59) or \
+                (len(parts) >= 3 and parts[2] > 59):
+            return "", False
+        while len(parts) < 3:
+            parts.append(0)
+        normalized = "%02d:%02d:%02d" % (parts[0], parts[1], parts[2])
+        self.var_start_time.set(normalized)
+        return normalized, True
+
+    def _validated_speed_factor(self):
+        """返回 (speed_factor, ok)，非法时按 1.0。"""
+        raw = self.var_speed.get().strip() or "1.0"
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 1.0, False
+        if not (value > 0) or math.isinf(value) or math.isnan(value):
+            return 1.0, False
+        self.var_speed.set("%g" % value)
+        return value, True
+
     # -------------------------------------------------- 分析
     def _start_analysis(self):
         if self._analyzing:
@@ -1371,6 +1447,18 @@ class PoolCoverageApp:
             sensitivity = min(1.0, max(0.0, float(self.var_sensitivity.get())))
         except (tk.TclError, ValueError):
             sensitivity = 0.5
+        # 真实时间参数：非法也给提示，但按默认值继续（空起始时间=相对时间，倍速 1.0）
+        start_time, time_ok = self._validated_start_time()
+        if not time_ok:
+            messagebox.showwarning(
+                "起始时间格式不对",
+                "起始时间请按 HH:MM:SS 填写（例如 08:44:38）；\n"
+                "本次将按相对时间显示曲线横轴。")
+        speed_factor, speed_ok = self._validated_speed_factor()
+        if not speed_ok:
+            messagebox.showwarning(
+                "加速倍数不正确",
+                "加速倍数必须是大于 0 的数字（例如 1.0 或 60）；\n本次按 1.0 分析。")
         try:
             out_dir = self._make_out_dir(video)
         except OSError as exc:
@@ -1381,13 +1469,14 @@ class PoolCoverageApp:
 
         # ---- 重置界面状态
         self._result = None
+        self._last_start_time = start_time
+        self._last_speed = speed_factor
         self.var_cov.set("—")
         self.var_uncovered.set("—")
         self.var_passes.set("—")
         self.var_hit.set("—")
         self.var_result_note.set("输出目录：%s" % out_dir)
-        for btn in (self.btn_open_dir, self.btn_play, self.btn_heatmap, self.btn_summary):
-            btn.configure(state="disabled")
+        self._update_result_buttons(None)
         self.progress.configure(value=0.0)
         self.var_status.set("准备分析…")
         self._set_analyzing(True)
@@ -1396,7 +1485,8 @@ class PoolCoverageApp:
         self._cancel_event.clear()
         self._worker = threading.Thread(
             target=self._worker_run,
-            args=(video, self._calib, out_dir, target, sensitivity),
+            args=(video, self._calib, out_dir, target, sensitivity,
+                  start_time, speed_factor),
             name="PoolCoverageAnalyze",
             daemon=True,
         )
@@ -1419,7 +1509,8 @@ class PoolCoverageApp:
         os.makedirs(out_dir, exist_ok=True)
         return out_dir
 
-    def _worker_run(self, video, calib, out_dir, target, sensitivity):
+    def _worker_run(self, video, calib, out_dir, target, sensitivity,
+                    start_time, speed_factor):
         """后台线程：只调用 core，不碰任何 Tk 控件，全部结果走 queue。"""
         try:
             result = core.analyze(
@@ -1428,6 +1519,8 @@ class PoolCoverageApp:
                 sensitivity=sensitivity,
                 progress=lambda frac, msg: self._queue.put(("progress", frac, msg)),
                 cancel=self._cancel_event.is_set,
+                start_time=(start_time or None),
+                speed_factor=speed_factor,
             )
             self._queue.put(("result", result))
         except BaseException as exc:  # noqa: BLE001 - 线程里必须兜住一切
@@ -1510,12 +1603,16 @@ class PoolCoverageApp:
         self.var_hit.set("%s（%d/%d 帧）" % (percent_text(hit), detected, frames))
 
         notes = ["输出目录：%s" % str(getattr(result, "out_dir", "") or "")]
+        if self._last_start_time:
+            notes.append("曲线横轴：真实时间（起始 %s，加速倍数 %g）"
+                         % (self._last_start_time, self._last_speed))
+        else:
+            notes.append("曲线横轴：相对时间（填了起始时间后可选真实时间）")
         warnings = list(getattr(result, "warnings", []) or [])
         if warnings:
             notes.append("提示：" + "；".join(str(w) for w in warnings))
         self.var_result_note.set("\n".join(notes))
-        for btn in (self.btn_open_dir, self.btn_play, self.btn_heatmap, self.btn_summary):
-            btn.configure(state="normal")
+        self._update_result_buttons(result)
         self.progress.configure(value=100.0)
         self._set_status("分析完成：覆盖率 %s，漏洗 %s。"
                          % (percent_text(coverage), percent_text(uncovered)))
@@ -1556,6 +1653,8 @@ class PoolCoverageApp:
         self.combo_template.configure(state="disabled" if analyzing else "readonly")
         self.combo_target.configure(state="disabled" if analyzing else "readonly")
         self.scale_sens.configure(state="disabled" if analyzing else "normal")
+        self.ent_start_time.configure(state=state)
+        self.ent_speed.configure(state=state)
         self.btn_cancel.configure(state="normal" if analyzing else "disabled")
 
     def _cancel_analysis(self):
@@ -1566,6 +1665,26 @@ class PoolCoverageApp:
         self._set_status("正在取消…（等待当前步骤结束）")
 
     # -------------------------------------------------- 结果按钮
+    def _result_button_specs(self):
+        """(按钮, AnalyzeResult 字段名)：字段为空（未生成）时按钮置灰。"""
+        return (
+            (self.btn_open_dir, "out_dir"),
+            (self.btn_play, "overlay_path"),
+            (self.btn_summary, "summary_json"),
+            (self.btn_coverage, "coverage_path"),
+            (self.btn_heatmap, "heatmap_path"),
+            (self.btn_curve, "curve_path"),
+            (self.btn_trajectory_img, "trajectory_image_path"),
+        )
+
+    def _update_result_buttons(self, result=None):
+        for btn, attribute in self._result_button_specs():
+            if result is None:
+                btn.configure(state="disabled")
+                continue
+            path = str(getattr(result, attribute, "") or "")
+            btn.configure(state="normal" if path else "disabled")
+
     def _open_result(self, attribute: str, label: str):
         if self._result is None:
             return

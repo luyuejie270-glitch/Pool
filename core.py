@@ -17,7 +17,12 @@ from dataclasses import dataclass, field, asdict
 import numpy as np
 import cv2
 
-VERSION = "0.2.0"
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:  # pragma: no cover
+    Image = ImageDraw = ImageFont = None
+
+VERSION = "0.3.0"
 SHAPE_RECT = "rect"
 SHAPE_ELLIPSE = "ellipse"
 SHAPE_POLY = "poly"
@@ -59,6 +64,9 @@ class AnalyzeResult:
     summary_json: str
     curve: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+    coverage_path: str = ""
+    curve_path: str = ""
+    trajectory_image_path: str = ""
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -108,6 +116,87 @@ def _check_cancel(cancel):
 def _odd(v, lo=3):
     v = max(lo, int(round(v)))
     return v if v % 2 == 1 else v + 1
+
+
+# ---------------------------------------------------------------- 通用绘图工具
+_CJK_FONT_CACHE = []
+
+
+def _find_cjk_font():
+    """找一个可用的中文字体（Windows 用微软雅黑；Linux/安卓用 Noto/文泉驿）"""
+    if _CJK_FONT_CACHE:
+        return _CJK_FONT_CACHE[0]
+    cands = []
+    if os.name == "nt":
+        win = os.environ.get("WINDIR", "C:/Windows")
+        cands += [os.path.join(win, "Fonts", n) for n in
+                  ("msyh.ttc", "msyhbd.ttc", "simhei.ttf", "simsun.ttc", "Deng.ttf")]
+    cands += [
+        "/system/fonts/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    ]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        cands += [os.path.join(meipass, "msyh.ttc"),
+                  os.path.join(meipass, "NotoSansCJK-Regular.ttc")]
+    cands.append(os.path.join(_base_dir(), "msyh.ttc"))
+    for c in cands:
+        if os.path.isfile(c):
+            _CJK_FONT_CACHE.append(c)
+            return c
+    _CJK_FONT_CACHE.append(None)
+    return None
+
+
+def _font(size):
+    path = _find_cjk_font()
+    if not path or ImageFont is None:
+        return None
+    try:
+        return ImageFont.truetype(path, int(max(9, size)))
+    except Exception:
+        return None
+
+
+def _text(img_bgr, xy, text, size=22, color=(255, 255, 255)):
+    """在 BGR ndarray 上写文字（有中文字体用 Pillow，否则退回 OpenCV 英文）"""
+    f = _font(size)
+    if f is None or Image is None:
+        cv2.putText(img_bgr, str(text), (int(xy[0]), int(xy[1])),
+                    cv2.FONT_HERSHEY_SIMPLEX, size / 28.0, color, 1, cv2.LINE_AA)
+        return img_bgr
+    pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    ImageDraw.Draw(pil).text((int(xy[0]), int(xy[1])), str(text), font=f,
+                             fill=(int(color[2]), int(color[1]), int(color[0])))
+    return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+
+
+def _parse_hms(text):
+    """解析 HH:MM 或 HH:MM:SS；失败返回 None"""
+    if text is None:
+        return None
+    s = str(text).strip().replace("：", ":")
+    if not s:
+        return None
+    m = re.match(r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$", s)
+    if not m:
+        return None
+    h, mi, se = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+    if h > 23 or mi > 59 or se > 59:
+        return None
+    return h * 3600 + mi * 60 + se
+
+
+def _fmt_clock(sec):
+    sec = int(round(sec)) % 86400
+    return "%02d:%02d:%02d" % (sec // 3600, (sec // 60) % 60, sec % 60)
+
+
+def _fmt_min(sec):
+    sec = int(round(sec))
+    return "+%d分%02d秒" % (sec // 60, sec % 60)
 
 
 # ---------------------------------------------------------------- 视频读取
@@ -494,64 +583,189 @@ def _runs_from_detections(dets, gap_max):
     return runs
 
 
-def _heat_colors(pass_cnt):
-    heat = np.zeros(pass_cnt.shape + (3,), np.uint8)
-    lut = [(0, 0, 180), (180, 80, 0), (0, 170, 255), (0, 220, 120), (245, 245, 245)]
-    heat[pass_cnt == 0] = lut[0]
-    heat[pass_cnt == 1] = lut[1]
-    heat[pass_cnt == 2] = lut[2]
-    heat[pass_cnt == 3] = lut[3]
-    heat[pass_cnt >= 4] = lut[4]
-    return heat
-
-
-def _save_heatmap(path, pass_cnt, mask_small, calib, pts, crop, ds, out_w=1000):
-    heat = _heat_colors(pass_cnt)
-    heat[~mask_small.astype(bool)] = (25, 25, 25)
-    gh, gw = heat.shape[:2]
-    out_w = max(360, min(int(out_w), int(gw * 2)))
-    r = out_w / float(gw)
-    out_h = max(60, int(round(gh * r)))
-    heat = cv2.resize(heat, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+def _compose_map(colors, mask_small, calib, crop, ds, legend_items, title, out_w=1100):
+    """生成带中文标题/图例的覆盖类地图（返回 BGR ndarray）"""
+    arr = colors.copy()
+    arr[~mask_small.astype(bool)] = (238, 238, 238)
+    gh, gw = arr.shape[:2]
+    out_w = int(max(420, min(out_w, gw * 2)))
+    ratio = out_w / float(gw)
+    out_h = max(60, int(round(gh * ratio)))
+    big = cv2.resize(arr, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
 
     def mp(x, y):
-        return (int(round((x - crop[0]) / ds * r)), int(round((y - crop[1]) / ds * r)))
+        return (int(round((x - crop[0]) / ds * ratio)), int(round((y - crop[1]) / ds * ratio)))
 
     if calib.shape == SHAPE_RECT:
-        cv2.polylines(heat, [np.array([mp(*p) for p in _order_rect_points(calib.points)], np.int32)],
-                      True, (255, 255, 255), 2)
+        pts = np.array([mp(*p) for p in _order_rect_points(calib.points)], np.int32)
+        cv2.polylines(big, [pts], True, (110, 110, 110), 2)
     elif calib.shape == SHAPE_POLY:
-        cv2.polylines(heat, [np.array([mp(*p) for p in calib.points], np.int32)],
-                      True, (255, 255, 255), 2)
+        pts = np.array([mp(*p) for p in calib.points], np.int32)
+        cv2.polylines(big, [pts], True, (110, 110, 110), 2)
     else:
         center, axes, angle = _ellipse_params(calib)
-        c = mp(*center)
-        cv2.ellipse(heat, c, (max(2, int(axes[0] / 2 / ds * r)),
-                              max(2, int(axes[1] / 2 / ds * r))),
-                    angle, 0, 360, (255, 255, 255), 2)
-    last_k = None
-    prev_pt = None
-    for (k, x, y) in pts:
-        pt = mp(x, y)
-        if prev_pt is not None and last_k is not None and k - last_k <= GAP_FRAMES_MAX:
-            cv2.line(heat, prev_pt, pt, (255, 255, 255), 1)
-        prev_pt = pt
-        last_k = k
-    lut = [(0, 0, 180), (180, 80, 0), (0, 170, 255), (0, 220, 120), (245, 245, 245)]
-    legend_h = 62
-    legend = np.zeros((legend_h, out_w, 3), np.uint8)
-    labels = ["uncovered", "1x", "2x", "3x", "4x+"]
-    for i, lab in enumerate(labels):
-        x0 = 14 + i * max(1, (out_w - 20) // 5)
-        col = tuple(int(v) for v in lut[i])
-        cv2.rectangle(legend, (x0, 16), (x0 + 26, 44), col, -1)
-        cv2.putText(legend, lab, (x0 + 32, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (240, 240, 240), 1, cv2.LINE_AA)
-    canvas = np.vstack([heat, legend])
+        cv2.ellipse(big, mp(*center),
+                    (max(2, int(axes[0] / 2 / ds * ratio)), max(2, int(axes[1] / 2 / ds * ratio))),
+                    angle, 0, 360, (110, 110, 110), 2)
+
+    strip_h = 96
+    strip = np.full((strip_h, out_w, 3), 255, np.uint8)
+    strip = _text(strip, (16, 10), title, 22, (35, 35, 35))
+    n = max(1, len(legend_items))
+    slot = (out_w - 32) / float(n)
+    for i, (label, bgr) in enumerate(legend_items):
+        x = int(16 + slot * i)
+        cv2.rectangle(strip, (x, 50), (x + 28, 76), tuple(int(v) for v in bgr), -1)
+        cv2.rectangle(strip, (x, 50), (x + 28, 76), (130, 130, 130), 1)
+        strip = _text(strip, (x + 36, 52), label, 19, (45, 45, 45))
+    return np.vstack([big, strip])
+
+
+def _save_maps(out_dir, cov, pass_cnt, mask_small, calib, crop, ds):
+    """输出两张图：coverage_map.png（两色覆盖图）与 heatmap.png（次数热力图）"""
+    # 覆盖图：绿=已清洗，白=未清洗
+    colors = np.full(pass_cnt.shape + (3,), 255, np.uint8)
+    colors[cov > 0] = (46, 160, 67)
+    img = _compose_map(colors, mask_small, calib, crop, ds,
+                       [("已清洗", (46, 160, 67)), ("未清洗", (255, 255, 255))],
+                       "覆盖图（绿色=已清洗，白色=未清洗）")
+    cov_path = os.path.join(out_dir, "coverage_map.png")
+    cv2.imwrite(cov_path, img)
+
+    # 热力图：白=未清洗，蓝/黄/红/黑 = 1/2/3/4次以上
+    colors = np.full(pass_cnt.shape + (3,), 255, np.uint8)
+    colors[pass_cnt == 1] = (230, 120, 40)
+    colors[pass_cnt == 2] = (0, 215, 255)
+    colors[pass_cnt == 3] = (40, 40, 220)
+    colors[pass_cnt >= 4] = (0, 0, 0)
+    img = _compose_map(colors, mask_small, calib, crop, ds,
+                       [("未清洗", (255, 255, 255)), ("1次", (230, 120, 40)),
+                        ("2次", (0, 215, 255)), ("3次", (40, 40, 220)),
+                        ("4次及以上", (0, 0, 0))],
+                       "热力图（白=未清洗；蓝/黄/红/黑=1/2/3/4次以上）")
+    heat_path = os.path.join(out_dir, "heatmap.png")
+    cv2.imwrite(heat_path, img)
+    return cov_path, heat_path
+
+
+def _save_curve_chart(path, curve_real, start_sec, speed, duration_real):
+    """输出覆盖率-真实时间曲线图 coverage_curve.png"""
+    W, H = 1100, 540
+    L, R, T, B = 92, 44, 96, 78
+    pw, ph = W - L - R, H - T - B
+    t0, t1 = curve_real[0][0], curve_real[-1][0]
+    span = max(1.0, t1 - t0)
+    x_of = lambda t: L + (t - t0) / span * pw
+    y_of = lambda c: T + (1.0 - max(0.0, min(1.0, c))) * ph
+
+    img = None
+    if Image is not None:
+        img = Image.new("RGB", (W, H), (255, 255, 255))
+        d = ImageDraw.Draw(img)
+        f_title, f_sub, f_tick, f_note = _font(26), _font(16), _font(15), _font(18)
+        # 网格
+        for i in range(5):
+            frac = i / 4.0
+            y = y_of(frac)
+            for x in range(int(L), int(W - R), 8):
+                d.line([(x, y), (x + 4, y)], fill=(215, 215, 215), width=1)
+            if f_tick:
+                d.text((L - 14, y - 9), "%d%%" % int(frac * 100), font=f_tick,
+                       fill=(110, 110, 110), anchor="ra")
+        # x 轴刻度
+        for i in range(7):
+            frac = i / 6.0
+            t = t0 + span * frac
+            x = x_of(t)
+            d.line([(x, T), (x, T + ph)], fill=(235, 235, 235), width=1)
+            label = _fmt_clock(t) if start_sec is not None else _fmt_min(t)
+            if f_tick:
+                d.text((x, H - B + 20), label, font=f_tick, fill=(110, 110, 110), anchor="ma")
+        # 面积 + 折线
+        pts = [(x_of(t), y_of(c)) for t, c in curve_real[::max(1, len(curve_real) // 900)]] or [(L, T + ph)]
+        poly = [(L, T + ph)] + pts + [(W - R, T + ph)]
+        d.polygon(poly, fill=(219, 234, 252))
+        d.line(pts, fill=(37, 99, 235), width=3, joint="curve")
+        # 阈值线
+        for thr, label in ((0.5, "50%"), (0.8, "80%"), (0.9, "90%")):
+            y = y_of(thr)
+            d.line([(L, y), (W - R, y)], fill=(190, 210, 190), width=1)
+            d.text((W - R - 4, y - 20), label, font=f_tick, fill=(120, 150, 120), anchor="ra")
+        # 终点标注
+        ex, ey = x_of(t1), y_of(curve_real[-1][1])
+        d.ellipse([ex - 5, ey - 5, ex + 5, ey + 5], fill=(37, 99, 235))
+        d.text((min(ex + 10, W - R - 4), ey - 24), "%.1f%%" % (curve_real[-1][1] * 100),
+               font=f_note, fill=(37, 99, 235), anchor="ra" if ex > W - 160 else "la")
+        # 标题
+        d.text((L, 26), "覆盖率随时间变化", font=f_title, fill=(25, 25, 25))
+        if f_sub:
+            span_txt = ("视频 %.1f 秒 × %.0f 倍速 = 真实 %.1f 分钟" % (duration_real / max(1e-6, speed),
+                                                                  speed, duration_real / 60.0))
+            if start_sec is not None:
+                span_txt += "  ·  %s → %s" % (_fmt_clock(t0), _fmt_clock(t1))
+            d.text((L, 62), span_txt, font=f_sub, fill=(110, 110, 110))
+        img.save(path)
+        return path
+
+    # 无 Pillow 时的退路：OpenCV 画英文版
+    canvas = np.full((H, W, 3), 255, np.uint8)
+    for i in range(5):
+        frac = i / 4.0
+        y = int(y_of(frac))
+        cv2.line(canvas, (L, y), (W - R, y), (220, 220, 220), 1)
+        cv2.putText(canvas, "%d%%" % int(frac * 100), (L - 46, y + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (110, 110, 110), 1)
+    pts = np.array([[int(x_of(t)), int(y_of(c))] for t, c in curve_real[::max(1, len(curve_real) // 900)]]
+                   or [[L, T + ph]], np.int32)
+    cv2.polylines(canvas, [pts], False, (235, 99, 37), 3)
+    cv2.putText(canvas, "coverage vs real time", (L, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                0.9, (30, 30, 30), 2)
     cv2.imwrite(path, canvas)
+    return path
 
 
-# ---------------------------------------------------------------- 叠加视频
+def _save_trajectory_image(path, frame, calib, pts, coverage, start_sec, speed, fps):
+    """输出完整轨迹图 trajectory.png（全分辨率，含起点/终点）"""
+    vis = frame.copy()
+    if calib.shape == SHAPE_RECT:
+        cv2.polylines(vis, [np.array(_order_rect_points(calib.points), np.int32)],
+                      True, (0, 255, 255), 3)
+    elif calib.shape == SHAPE_POLY:
+        cv2.polylines(vis, [np.array(calib.points, np.int32)], True, (0, 255, 255), 3)
+    else:
+        center, axes, angle = _ellipse_params(calib)
+        cv2.ellipse(vis, (int(center[0]), int(center[1])),
+                    (max(3, int(axes[0] / 2)), max(3, int(axes[1] / 2))), angle, 0, 360,
+                    (0, 255, 255), 3)
+    last_k = None
+    for (k, x, y) in pts:
+        p = (int(round(x)), int(round(y)))
+        if last_k is not None and k - last_k <= GAP_FRAMES_MAX:
+            cv2.line(vis, prev_p, p, (0, 150, 255), 4, cv2.LINE_AA)
+        prev_p = p
+        last_k = k
+    if pts:
+        sx, sy = int(round(pts[0][1])), int(round(pts[0][2]))
+        ex, ey = int(round(pts[-1][1])), int(round(pts[-1][2]))
+        cv2.circle(vis, (sx, sy), 12, (0, 200, 0), -1)
+        cv2.circle(vis, (sx, sy), 12, (255, 255, 255), 2)
+        cv2.circle(vis, (ex, ey), 12, (0, 0, 230), -1)
+        cv2.circle(vis, (ex, ey), 12, (255, 255, 255), 2)
+        vis = _text(vis, (max(8, sx + 18), max(26, sy - 18)), "起点", 26, (255, 255, 255))
+        vis = _text(vis, (max(8, ex + 18), max(26, ey - 18)), "终点", 26, (255, 255, 255))
+    title = "完整轨迹 · 覆盖率 %.1f%%" % (coverage * 100)
+    vis = _text(vis, (20, 138), title, 32, (0, 0, 0))
+    vis = _text(vis, (18, 136), title, 32, (255, 255, 255))
+    if start_sec is not None and pts:
+        t_end = pts[-1][0] / max(1e-6, fps) * speed
+        sub = "真实时间 %s → %s" % (_fmt_clock(start_sec), _fmt_clock(start_sec + t_end))
+        vis = _text(vis, (20, 184), sub, 26, (0, 0, 0))
+        vis = _text(vis, (18, 182), sub, 26, (255, 255, 255))
+    cv2.imwrite(path, vis)
+    return path
+
+
+# ---------------------------------------------------------------- 叠加视频# ---------------------------------------------------------------- 叠加视频
 def _open_writer(path, size, fps, ffmpeg):
     if ffmpeg:
         cmd = [ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -600,7 +814,8 @@ def _close_writer(writer):
 
 # ---------------------------------------------------------------- 主分析
 def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
-            progress=None, cancel=None, overlay_width=1280):
+            progress=None, cancel=None, overlay_width=1280,
+            start_time=None, speed_factor=1.0):
     if target not in ("auto", "dark", "bright"):
         raise ValueError("未知目标类型：%s" % target)
     if not os.path.isfile(video_path):
@@ -608,6 +823,13 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
     if not isinstance(calib, Calibration) or not calib.points:
         raise RuntimeError("尚未完成池面标定")
     os.makedirs(out_dir, exist_ok=True)
+    start_sec = _parse_hms(start_time)
+    try:
+        speed = float(speed_factor or 1.0)
+    except (TypeError, ValueError):
+        speed = 1.0
+    if not (speed > 0):
+        speed = 1.0
 
     info = video_info(video_path)
     fps, n_frames = info["fps"] or 25.0, info["frames"]
@@ -659,6 +881,8 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
 
     # 第一遍：逐帧检测 + 跟踪
     warnings = []
+    if start_time and start_sec is None:
+        warnings.append("起始时间格式不正确（应为 HH:MM:SS），曲线图按相对时间显示。")
     gate = 0.15 * math.hypot(vw, vh)
 
     def run_track_pass(mode, p0=0.05, p1=0.60, size_hint=None):
@@ -799,13 +1023,32 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
         for a, b in zip(run[:-1], run[1:]):
             path_len_px += math.hypot(b[1] - a[1], b[2] - a[2])
 
-    # 热力图
-    _progress(progress, 0.68, "生成热力图…")
-    heatmap_path = os.path.join(out_dir, "heatmap.png")
+    # 覆盖图 + 热力图（两张）
+    _progress(progress, 0.68, "生成覆盖图/热力图…")
+    cov_path, heatmap_path = "", ""
     try:
-        _save_heatmap(heatmap_path, pc2, mask_small, calib, pts_plane, (x0, y0), ds)
+        cov_path, heatmap_path = _save_maps(out_dir, cov, pc2, mask_small, calib, (x0, y0), ds)
     except Exception:
-        heatmap_path = ""
+        cov_path = heatmap_path = ""
+
+    # 覆盖率-真实时间 曲线图
+    curve_real = [((start_sec + t * speed) if start_sec is not None else t * speed, c)
+                  for t, c in curve]
+    duration_real = (n_frames - 1) / fps * speed
+    curve_path = os.path.join(out_dir, "coverage_curve.png")
+    try:
+        _save_curve_chart(curve_path, curve_real, start_sec, speed, duration_real)
+    except Exception:
+        curve_path = ""
+
+    # 完整轨迹图
+    trajectory_image = os.path.join(out_dir, "trajectory.png")
+    try:
+        base_frame = probe_frame(video_path, 0)
+        _save_trajectory_image(trajectory_image, base_frame, calib, pts_plane,
+                               coverage, start_sec, speed, fps)
+    except Exception:
+        trajectory_image = ""
 
     # 轨迹 CSV
     traj_csv = os.path.join(out_dir, "trajectory.csv")
@@ -839,8 +1082,7 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
     else:
         center, axes, angle = _ellipse_params(calib)
     cap = cv2.VideoCapture(video_path)
-    trail = []
-    last_trail_k = None
+    trail_pts = []          # [(帧号, (x,y)), ...] 全程累积，每帧整条重绘
     for k in range(n_frames):
         ok, frame = cap.read()
         if not ok:
@@ -863,21 +1105,40 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
             y2p = int((d["cy"] + d["h"] / 2) * sx)
             cv2.rectangle(vis, (x1p, y1p), (x2p, y2p), (0, 255, 0), 2)
             pt = (int(d["cx"] * sx), int(d["cy"] * sx))
-            if trail and last_trail_k is not None and k - last_trail_k <= GAP_FRAMES_MAX:
-                cv2.line(vis, trail[-1], pt, (0, 220, 255), 2)
-            trail.append(pt)
-            last_trail_k = k
+            trail_pts.append((k, pt))
+        # 每帧重绘完整轨迹（这才是"看到完整轨迹"）
+        if len(trail_pts) > 1:
+            for (k1, p1), (k2, p2) in zip(trail_pts[:-1], trail_pts[1:]):
+                if k2 - k1 <= GAP_FRAMES_MAX:
+                    cv2.line(vis, p1, p2, (0, 165, 255), 3, cv2.LINE_AA)
+        if trail_pts:
+            cv2.circle(vis, trail_pts[0][1], 7, (0, 200, 0), -1)
+            cv2.circle(vis, trail_pts[0][1], 7, (255, 255, 255), 2)
         cov_now = curve[k][1]
         cv2.putText(vis, "coverage %.1f%%" % (cov_now * 100),
                     (max(8, out_w - 260), 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                     (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(vis, "t=%.1fs" % (k / fps), (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        if start_sec is not None:
+            t_txt = _fmt_clock(start_sec + k / fps * speed)
+        else:
+            t_txt = "T+%.1fs" % (k / fps * speed)
+        cv2.putText(vis, t_txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (255, 255, 255), 2, cv2.LINE_AA)
         _write_frame(writer, vis)
         if k % 30 == 0:
             _check_cancel(cancel)
             _progress(progress, 0.72 + 0.26 * k / max(1, n_frames),
                       "渲染轨迹视频… 第 %d/%d 帧" % (k, n_frames))
+    # 结尾定格：完整轨迹展示
+    try:
+        if trail_pts:
+            freeze = vis.copy()
+            cv2.putText(freeze, "END  full trajectory", (max(10, out_w // 2 - 150), out_h // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+            for _ in range(int(round(2.5 * fps))):
+                _write_frame(writer, freeze)
+    except Exception:
+        pass
     cap.release()
     ok_close = _close_writer(writer)
     if not ok_close:
@@ -899,6 +1160,9 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
         path_len_px=float(path_len_px), overlay_path=os.path.abspath(ov_path),
         heatmap_path=os.path.abspath(heatmap_path) if heatmap_path else "",
         trajectory_csv=os.path.abspath(traj_csv), summary_json=os.path.abspath(summary_path),
+        coverage_path=os.path.abspath(cov_path) if cov_path else "",
+        curve_path=os.path.abspath(curve_path) if curve_path else "",
+        trajectory_image_path=os.path.abspath(trajectory_image) if trajectory_image else "",
         curve=[[float(t), float(c)] for t, c in curve],
         warnings=list(warnings),
     )
@@ -908,7 +1172,8 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
         "shape": calib.shape,
         "calib_points": [[float(x), float(y)] for x, y in calib.points],
         "params": {"target": target, "sensitivity": sens, "swath_factor": SWATH_FACTOR,
-                   "gap_frames": GAP_FRAMES_MAX, "pixel_basis": True},
+                   "gap_frames": GAP_FRAMES_MAX, "pixel_basis": True,
+                   "start_time": start_time or "", "speed_factor": speed},
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
     })
     with open(summary_path, "w", encoding="utf-8") as f:
