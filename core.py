@@ -22,7 +22,7 @@ try:
 except Exception:  # pragma: no cover
     Image = ImageDraw = ImageFont = None
 
-VERSION = "0.3.0"
+VERSION = "0.5.4"
 SHAPE_RECT = "rect"
 SHAPE_ELLIPSE = "ellipse"
 SHAPE_POLY = "poly"
@@ -67,6 +67,7 @@ class AnalyzeResult:
     coverage_path: str = ""
     curve_path: str = ""
     trajectory_image_path: str = ""
+    shape: str = ""
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -171,6 +172,26 @@ def _text(img_bgr, xy, text, size=22, color=(255, 255, 255)):
     ImageDraw.Draw(pil).text((int(xy[0]), int(xy[1])), str(text), font=f,
                              fill=(int(color[2]), int(color[1]), int(color[0])))
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+
+
+def _imwrite(path, img):
+    """写图片：cv2.imwrite 在 Windows 上不支持中文路径，这里用 imencode + 文件流，
+    中文/特殊字符路径也能写出来。返回是否成功。"""
+    ext = os.path.splitext(str(path))[1].lower() or ".png"
+    if ext not in (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"):
+        ext = ".png"
+    try:
+        ok, buf = cv2.imencode(ext, img)
+        if ok:
+            with open(path, "wb") as f:
+                f.write(buf.tobytes())
+            return os.path.isfile(path) and os.path.getsize(path) > 0
+    except Exception:
+        pass
+    try:
+        return bool(cv2.imwrite(path, img))
+    except Exception:
+        return False
 
 
 def _parse_hms(text):
@@ -499,7 +520,8 @@ def _detect_candidates(gray, bg_gray, roi, mode, thr, pool_area, kern):
     return out
 
 
-def _estimate_robot_area(cap, bg_gray, roi, mode, thr, pool_area, kern, n_frames, samples=25):
+def _estimate_robot_area(cap, bg_gray, roi, mode, thr, pool_area, kern, n_frames,
+                         samples=25, det_scale=1.0):
     """抽样若干帧，用每帧最大候选的面积中位数估计机器人大小（机器人通常是最大的运动目标）"""
     areas = []
     idxs = np.linspace(0, max(0, n_frames - 1), max(6, int(samples))).astype(int)
@@ -508,6 +530,9 @@ def _estimate_robot_area(cap, bg_gray, roi, mode, thr, pool_area, kern, n_frames
         ok, frame = cap.read()
         if not ok:
             continue
+        if det_scale != 1.0:
+            frame = cv2.resize(frame, (bg_gray.shape[1], bg_gray.shape[0]),
+                               interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         cands = _detect_candidates(gray, bg_gray, roi, mode, thr, pool_area, kern)
         if cands:
@@ -539,6 +564,71 @@ def _pick_candidate(cands, prev, gate, size_ref, pred=None):
 
 
 # ---------------------------------------------------------------- 覆盖率
+def _raster_sweep(dets, runs, x0, y0, ds, gh, gw, mask_small, n_frames):
+    """统一栅格化：沿轨迹画“固定宽度的清洗带”（粗线段，不是一个个圆盘），
+    边缘是直边；同一条带子同时生成覆盖并集与经过次数，两张地图白色区域完全一致。"""
+    cov = np.zeros((gh, gw), np.uint8)
+    pc = np.zeros((gh, gw), np.uint16)
+    recent = np.zeros((gh, gw), np.uint8)   # 最近几次扫过的并集，用于合并“同一次经过”
+    curve = [None] * n_frames
+    pool_area = float(mask_small.sum()) if mask_small.any() else 1.0
+
+    def sweep_segment(x1, y1, x2, y2, r, k):
+        """画一条宽度 2r 的清洗带（平头线段），并更新覆盖/经过次数"""
+        nonlocal recent
+        ri = max(1, int(round(r)))
+        xa = max(0, int(min(x1, x2)) - ri - 1)
+        xb = min(gw, int(max(x1, x2)) + ri + 2)
+        ya = max(0, int(min(y1, y2)) - ri - 1)
+        yb = min(gh, int(max(y1, y2)) + ri + 2)
+        if xa >= xb or ya >= yb:
+            return
+        tmp = np.zeros((yb - ya, xb - xa), np.uint8)
+        cv2.line(tmp,
+                 (int(round(x1)) - xa, int(round(y1)) - ya),
+                 (int(round(x2)) - xa, int(round(y2)) - ya),
+                 1, thickness=max(1, 2 * ri), lineType=cv2.LINE_8)
+        tmp &= mask_small[ya:yb, xa:xb]
+        cov[ya:yb, xa:xb] |= tmp
+        rec_sub = recent[ya:yb, xa:xb]
+        new = tmp & (rec_sub == 0)
+        pc[ya:yb, xa:xb] += new
+        recent -= (recent > 0).astype(np.uint8)
+        rec_sub[:] |= tmp
+        cf = float(cov.sum()) / pool_area
+        if curve[k] is None or cf > curve[k]:
+            curve[k] = cf
+
+    for run in runs:
+        pts = []
+        for (k, cx, cy) in run:
+            d = dets[k]
+            r = math.sqrt(max(1.0, d["w"] * d["h"])) / 2.0 * SWATH_FACTOR / ds
+            pts.append((float((cx - x0) / ds), float((cy - y0) / ds), max(1.0, r), int(k)))
+        if len(pts) < 2:
+            continue
+        radii = sorted(p[2] for p in pts)
+        # 采样间距取半个带宽，保证带子连续、拐角不掉块
+        step = max(1.5, radii[len(radii) // 2])
+        for (x1, y1, r1, k1), (x2, y2, r2, k2) in zip(pts[:-1], pts[1:]):
+            dist = math.hypot(x2 - x1, y2 - y1)
+            n = max(1, int(round(dist / step)))
+            for i in range(n):
+                t = i / float(n)
+                t2 = (i + 1) / float(n)
+                sweep_segment(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t,
+                              x1 + (x2 - x1) * t2, y1 + (y2 - y1) * t2,
+                              r1 + (r2 - r1) * t, int(round(k1 + (k2 - k1) * t)))
+
+    last = 0.0
+    curve = [last if c is None else c for c in curve]
+    for i, c in enumerate(curve):
+        if c < last:
+            curve[i] = last
+        last = curve[i]
+    return cov, pc, curve
+
+
 def _resample_polyline(points, step):
     if len(points) < 2:
         return list(points)
@@ -566,17 +656,18 @@ def _resample_polyline(points, step):
 
 
 def _runs_from_detections(dets, gap_max):
+    """把检测点按“相邻检测间隔不超过 gap_max 帧”切成若干段轨迹。
+    注意：跳帧检测时中间会夹着空帧，不能把空帧当成轨迹结束。"""
     runs, cur, last_k = [], [], None
     for k in range(len(dets)):
-        if dets[k] is None:
+        d = dets[k]
+        if d is None:
+            continue
+        if cur and (k - last_k) > gap_max:
             if len(cur) > 1:
                 runs.append(cur)
             cur = []
-            continue
-        if cur and (k - last_k) > gap_max:
-            runs.append(cur)
-            cur = []
-        cur.append((k, dets[k]["cx"], dets[k]["cy"]))
+        cur.append((k, d["cx"], d["cy"]))
         last_k = k
     if len(cur) > 1:
         runs.append(cur)
@@ -621,7 +712,31 @@ def _compose_map(colors, mask_small, calib, crop, ds, legend_items, title, out_w
     return np.vstack([big, strip])
 
 
-def _save_maps(out_dir, cov, pass_cnt, mask_small, calib, crop, ds):
+def _draw_coverage_badge(img_bgr, coverage):
+    """在地图左上角画"覆盖率 xx.x%"标签（深色底 + 白字）"""
+    try:
+        txt = "覆盖率 %.1f%%" % (float(coverage) * 100.0)
+        f = _font(34)
+        pad = 14
+        if f is not None and Image is not None:
+            pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+            d = ImageDraw.Draw(pil)
+            box = d.textbbox((0, 0), txt, font=f)
+            tw, th = box[2] - box[0], box[3] - box[1]
+        else:
+            (tw, th), _ = cv2.getTextSize(txt.encode("utf-8") if False else "coverage %.1f%%" % (coverage * 100),
+                                          cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+            tw += 8
+        x0, y0 = 14, 14
+        x1, y1 = x0 + tw + pad * 2, y0 + th + pad * 2
+        # 纯色底（不做半透明叠加），保证两张图的徽标区域完全一致
+        cv2.rectangle(img_bgr, (x0, y0), (x1, y1), (38, 38, 38), -1)
+        return _text(img_bgr, (x0 + pad, y0 + pad - 6), txt, 34, (255, 255, 255))
+    except Exception:
+        return img_bgr
+
+
+def _save_maps(out_dir, cov, pass_cnt, mask_small, calib, crop, ds, coverage=0.0):
     """输出两张图：coverage_map.png（两色覆盖图）与 heatmap.png（次数热力图）"""
     # 覆盖图：绿=已清洗，白=未清洗
     colors = np.full(pass_cnt.shape + (3,), 255, np.uint8)
@@ -629,8 +744,10 @@ def _save_maps(out_dir, cov, pass_cnt, mask_small, calib, crop, ds):
     img = _compose_map(colors, mask_small, calib, crop, ds,
                        [("已清洗", (46, 160, 67)), ("未清洗", (255, 255, 255))],
                        "覆盖图（绿色=已清洗，白色=未清洗）")
+    img = _draw_coverage_badge(img, coverage)
     cov_path = os.path.join(out_dir, "coverage_map.png")
-    cv2.imwrite(cov_path, img)
+    if not _imwrite(cov_path, img):
+        cov_path = ""
 
     # 热力图：白=未清洗，蓝/黄/红/黑 = 1/2/3/4次以上
     colors = np.full(pass_cnt.shape + (3,), 255, np.uint8)
@@ -643,8 +760,10 @@ def _save_maps(out_dir, cov, pass_cnt, mask_small, calib, crop, ds):
                         ("2次", (0, 215, 255)), ("3次", (40, 40, 220)),
                         ("4次及以上", (0, 0, 0))],
                        "热力图（白=未清洗；蓝/黄/红/黑=1/2/3/4次以上）")
+    img = _draw_coverage_badge(img, coverage)
     heat_path = os.path.join(out_dir, "heatmap.png")
-    cv2.imwrite(heat_path, img)
+    if not _imwrite(heat_path, img):
+        heat_path = ""
     return cov_path, heat_path
 
 
@@ -704,8 +823,12 @@ def _save_curve_chart(path, curve_real, start_sec, speed, duration_real):
             if start_sec is not None:
                 span_txt += "  ·  %s → %s" % (_fmt_clock(t0), _fmt_clock(t1))
             d.text((L, 62), span_txt, font=f_sub, fill=(110, 110, 110))
-        img.save(path)
-        return path
+        try:
+            img.save(path)
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                return path
+        except Exception:
+            pass
 
     # 无 Pillow 时的退路：OpenCV 画英文版
     canvas = np.full((H, W, 3), 255, np.uint8)
@@ -720,8 +843,9 @@ def _save_curve_chart(path, curve_real, start_sec, speed, duration_real):
     cv2.polylines(canvas, [pts], False, (235, 99, 37), 3)
     cv2.putText(canvas, "coverage vs real time", (L, 40), cv2.FONT_HERSHEY_SIMPLEX,
                 0.9, (30, 30, 30), 2)
-    cv2.imwrite(path, canvas)
-    return path
+    if _imwrite(path, canvas):
+        return path
+    return ""
 
 
 def _save_trajectory_image(path, frame, calib, pts, coverage, start_sec, speed, fps):
@@ -761,8 +885,7 @@ def _save_trajectory_image(path, frame, calib, pts, coverage, start_sec, speed, 
         sub = "真实时间 %s → %s" % (_fmt_clock(start_sec), _fmt_clock(start_sec + t_end))
         vis = _text(vis, (20, 184), sub, 26, (0, 0, 0))
         vis = _text(vis, (18, 182), sub, 26, (255, 255, 255))
-    cv2.imwrite(path, vis)
-    return path
+    return path if _imwrite(path, vis) else ""
 
 
 # ---------------------------------------------------------------- 叠加视频# ---------------------------------------------------------------- 叠加视频
@@ -770,7 +893,7 @@ def _open_writer(path, size, fps, ffmpeg):
     if ffmpeg:
         cmd = [ffmpeg, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
                "-s", "%dx%d" % size, "-r", "%.3f" % fps, "-i", "-",
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
                "-pix_fmt", "yuv420p", "-movflags", "+faststart", path]
         try:
             pp = subprocess.Popen(cmd, stdin=subprocess.PIPE,
@@ -813,8 +936,107 @@ def _close_writer(writer):
 
 
 # ---------------------------------------------------------------- 主分析
+def _render_overlay(video_path, dets, n_frames, fps, vw, vh, calib, curve,
+                    out_dir, overlay_width, start_sec, speed, stride,
+                    progress, cancel, warnings):
+    """渲染轨迹叠加视频（独立函数：支持按需跳过）"""
+    _progress(progress, 0.72, "渲染轨迹视频…")
+    ffmpeg = _find_ffmpeg()
+    out_w = min(int(overlay_width), vw)
+    out_w -= out_w % 2
+    out_h = int(round(vh * out_w / float(vw)))
+    out_h -= out_h % 2
+    ov_path = os.path.join(out_dir, "overlay.mp4")
+    writer, ok_writer = _open_writer(ov_path, (out_w, out_h), fps, ffmpeg)
+    if not ok_writer:
+        raise RuntimeError("无法创建输出视频（缺少视频编码器）")
+    if ffmpeg is None:
+        warnings.append("未找到 ffmpeg，轨迹视频已用 MJPG/AVI 编码，兼容性略低。")
+    poly_pts = None
+    if calib.shape == SHAPE_RECT:
+        rect_pts = np.array(_order_rect_points(calib.points), np.int32)
+    elif calib.shape == SHAPE_POLY:
+        poly_pts = np.array(calib.points, np.float32).reshape(-1, 2)
+    else:
+        center, axes, angle = _ellipse_params(calib)
+    cap = cv2.VideoCapture(video_path)
+    # 增量轨迹层：每帧只画新增的一小段，避免长视频 O(n²) 重绘
+    trail_mask = np.zeros((out_h, out_w), np.uint8)
+    start_mask = np.zeros((out_h, out_w), np.uint8)
+    trail_prev = None
+    trail_last_k = None
+    for k in range(n_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        vis = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        sx = out_w / float(vw)
+        if calib.shape == SHAPE_RECT:
+            cv2.polylines(vis, [(rect_pts * sx).astype(np.int32)], True, (0, 255, 255), 2)
+        elif calib.shape == SHAPE_POLY:
+            cv2.polylines(vis, [(poly_pts * sx).astype(np.int32)], True, (0, 255, 255), 2)
+        else:
+            cv2.ellipse(vis, (int(center[0] * sx), int(center[1] * sx)),
+                        (max(2, int(axes[0] / 2 * sx)), max(2, int(axes[1] / 2 * sx))),
+                        angle, 0, 360, (0, 255, 255), 2)
+        d = dets[k]
+        if d is not None:
+            x1p = int((d["cx"] - d["w"] / 2) * sx)
+            y1p = int((d["cy"] - d["h"] / 2) * sx)
+            x2p = int((d["cx"] + d["w"] / 2) * sx)
+            y2p = int((d["cy"] + d["h"] / 2) * sx)
+            cv2.rectangle(vis, (x1p, y1p), (x2p, y2p), (0, 255, 0), 2)
+            pt = (int(d["cx"] * sx), int(d["cy"] * sx))
+            if trail_prev is not None and (k - trail_last_k) <= max(GAP_FRAMES_MAX, stride * 2):
+                cv2.line(trail_mask, trail_prev, pt, 255, 3, cv2.LINE_AA)
+            if trail_prev is None:
+                cv2.circle(start_mask, pt, 7, 255, -1)
+            trail_prev, trail_last_k = pt, k
+        # 合成完整累计轨迹（掩膜索引，速度快）
+        if trail_prev is not None:
+            vis[trail_mask > 0] = (0, 165, 255)
+            vis[start_mask > 0] = (0, 200, 0)
+        cov_now = curve[k][1]
+        cv2.putText(vis, "coverage %.1f%%" % (cov_now * 100),
+                    (max(8, out_w - 260), 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        if start_sec is not None:
+            t_txt = _fmt_clock(start_sec + k / fps * speed)
+        else:
+            t_txt = "T+%.1fs" % (k / fps * speed)
+        cv2.putText(vis, t_txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        _write_frame(writer, vis)
+        if k % 30 == 0:
+            _check_cancel(cancel)
+            _progress(progress, 0.72 + 0.26 * k / max(1, n_frames),
+                      "渲染轨迹视频… 第 %d/%d 帧" % (k, n_frames))
+    # 结尾定格：完整轨迹展示
+    try:
+        if trail_prev is not None:
+            freeze = vis.copy()
+            cv2.putText(freeze, "END  full trajectory", (max(10, out_w // 2 - 150), out_h // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+            for _ in range(int(round(2.5 * fps))):
+                _write_frame(writer, freeze)
+    except Exception:
+        pass
+    cap.release()
+    ok_close = _close_writer(writer)
+    if not ok_close:
+        warnings.append("视频编码可能未完整结束，若播放异常可改用无轨迹视频。")
+    if not os.path.isfile(ov_path):
+        base = os.path.splitext(ov_path)[0]
+        for ext in (".avi", ".mp4"):
+            if os.path.isfile(base + ext):
+                ov_path = base + ext
+                break
+
+    return ov_path
+
+
 def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
-            progress=None, cancel=None, overlay_width=1280,
+            progress=None, cancel=None, overlay_width=1280, make_video=True,
             start_time=None, speed_factor=1.0):
     if target not in ("auto", "dark", "bright"):
         raise ValueError("未知目标类型：%s" % target)
@@ -861,6 +1083,21 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
     sens = min(1.0, max(0.0, float(sensitivity)))
     thr = int(round(28 - 26 * sens))
 
+    # 加速模式：大分辨率画面先把检测降采样到一半；长视频再隔帧检测
+    det_scale = 0.5 if max(vw, vh) >= 1600 else 1.0
+    stride = 2 if (fps >= 25 and n_frames >= 600) else 1
+    dw = int(round(vw * det_scale)); dh = int(round(vh * det_scale))
+    if det_scale != 1.0:
+        roi_det = cv2.resize(roi, (dw, dh), interpolation=cv2.INTER_NEAREST)
+        pool_det = cv2.resize(pool_mask, (dw, dh), interpolation=cv2.INTER_NEAREST)
+        pool_area_det = int(np.count_nonzero(pool_det))
+        s2 = min(dw, dh) / 1080.0
+        kern_det = {
+            "open": np.ones((_odd(5 * max(s2, 0.5)), _odd(5 * max(s2, 0.5))), np.uint8),
+            "close": np.ones((_odd(25 * max(s2, 0.5)), _odd(25 * max(s2, 0.5))), np.uint8),
+        }
+    else:
+        roi_det, pool_area_det, kern_det = roi, pool_area, kern
     _progress(progress, 0.0, "读取视频背景…")
     # 背景：均匀抽帧取中值
     cap = cv2.VideoCapture(video_path)
@@ -873,6 +1110,8 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
         ok, fr = cap.read()
         if ok and fr is not None:
+            if det_scale != 1.0:
+                fr = cv2.resize(fr, (dw, dh), interpolation=cv2.INTER_AREA)
             frames_bg.append(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY))
     if not frames_bg:
         cap.release()
@@ -881,6 +1120,9 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
 
     # 第一遍：逐帧检测 + 跟踪
     warnings = []
+    if det_scale != 1.0 or stride > 1:
+        warnings.append("已启用快速模式：检测分辨率 ×%.2f、隔 %d 帧检测（不影响覆盖率统计口径）。"
+                        % (det_scale, stride))
     if start_time and start_sec is None:
         warnings.append("起始时间格式不正确（应为 HH:MM:SS），曲线图按相对时间显示。")
     gate = 0.15 * math.hypot(vw, vh)
@@ -895,11 +1137,26 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
         misses = 0
         cnt = 0
         for k in range(n_frames):
+            if stride > 1 and (k % stride):
+                if not cap2.grab():
+                    break
+                if k % 30 == 0:
+                    _progress(progress, p0 + (p1 - p0) * k / max(1, n_frames),
+                              "检测机器人… 第 %d/%d 帧" % (k, n_frames))
+                continue
             ok, frame = cap2.read()
             if not ok:
                 break
+            if det_scale != 1.0:
+                frame = cv2.resize(frame, (dw, dh), interpolation=cv2.INTER_AREA)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            cands = _detect_candidates(gray, bg_gray, roi, mode, thr, pool_area, kern)
+            cands = _detect_candidates(gray, bg_gray, roi_det, mode, thr, pool_area_det, kern_det)
+            if det_scale != 1.0:
+                inv = 1.0 / det_scale
+                for c in cands:
+                    c["cx"] *= inv; c["cy"] *= inv
+                    c["w"] *= inv; c["h"] *= inv
+                    c["area"] *= inv * inv
             pred = None
             if prev is not None:
                 if prev2 is not None:
@@ -930,8 +1187,8 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
     _progress(progress, 0.04, "估计机器人尺寸…")
     cap_hint = cv2.VideoCapture(video_path)
     hint_mode = "dark" if target in ("auto", "dark") else "bright"
-    size_hint = _estimate_robot_area(cap_hint, bg_gray, roi, hint_mode, thr,
-                                     pool_area, kern, n_frames)
+    size_hint = _estimate_robot_area(cap_hint, bg_gray, roi_det, hint_mode, thr,
+                                     pool_area_det, kern_det, n_frames, det_scale=det_scale)
     cap_hint.release()
     print("机器人尺寸估计(px^2):", size_hint)
 
@@ -941,8 +1198,8 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
         if detected < 0.25 * n_frames:
             _progress(progress, 0.06, "暗色目标较少，尝试亮色目标…")
             cap_hint2 = cv2.VideoCapture(video_path)
-            hint2 = _estimate_robot_area(cap_hint2, bg_gray, roi, "bright", thr,
-                                         pool_area, kern, n_frames)
+            hint2 = _estimate_robot_area(cap_hint2, bg_gray, roi_det, "bright", thr,
+                                         pool_area_det, kern_det, n_frames, det_scale=det_scale)
             cap_hint2.release()
             dets2, detected2 = run_track_pass("bright", 0.10, 0.60, hint2)
             if detected2 > detected:
@@ -966,57 +1223,33 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
                             interpolation=cv2.INTER_NEAREST) > 127
     pool_area_small = float(mask_small.sum())
 
-    cov = np.zeros((gh, gw), np.uint8)
-    pass_cnt = np.zeros((gh, gw), np.uint16)
-    pts_plane = []
-    curve = []
-    prev_idx = None
+    pts_plane = [(k, float(d["cx"]), float(d["cy"])) for k, d in enumerate(dets) if d is not None]
+    # 轨迹平滑：检测框中心有 1~3 像素抖动，平滑后再栅格化，避免把抖动画成小圆弧
+    dets_cov = [dict(d) if d else None for d in dets]
     for k in range(n_frames):
-        d = dets[k]
-        if d is not None:
-            r = math.sqrt(d["w"] * d["h"]) / 2.0 * SWATH_FACTOR
-            r_px = max(1, int(round(r / ds)))
-            cx = (d["cx"] - x0) / ds
-            cy = (d["cy"] - y0) / ds
-            tmp = np.zeros((gh, gw), np.uint8)
-            if prev_idx is not None and (k - prev_idx) <= GAP_FRAMES_MAX:
-                pd = dets[prev_idx]
-                ptx = int(round((pd["cx"] - x0) / ds))
-                pty = int(round((pd["cy"] - y0) / ds))
-                cv2.line(tmp, (ptx, pty), (int(round(cx)), int(round(cy))), 1,
-                         thickness=max(1, 2 * r_px))
-            else:
-                cv2.circle(tmp, (int(round(cx)), int(round(cy))), r_px, 1, -1)
-            tmp = (tmp > 0).astype(np.uint8) * mask_small.astype(np.uint8)
-            cov |= tmp
-            pass_cnt += tmp.astype(np.uint16)
-            pts_plane.append((k, float(d["cx"]), float(d["cy"])))
-            prev_idx = k
-        curve.append((k / fps, float(cov.sum()) / max(1e-6, pool_area_small)))
-        if k % 60 == 0:
-            _check_cancel(cancel)
+        if dets[k] is None:
+            continue
+        xs, ys, ws, hs = [], [], [], []
+        for j in range(max(0, k - 2), min(n_frames, k + 3)):
+            dj = dets[j]
+            if dj is None:
+                continue
+            xs.append(dj["cx"]); ys.append(dj["cy"])
+            ws.append(dj["w"]); hs.append(dj["h"])
+        if xs:
+            dets_cov[k]["cx"] = sum(xs) / len(xs)
+            dets_cov[k]["cy"] = sum(ys) / len(ys)
+            dets_cov[k]["w"] = sum(ws) / len(ws)
+            dets_cov[k]["h"] = sum(hs) / len(hs)
+    runs = _runs_from_detections(dets_cov, GAP_FRAMES_MAX)
+    cov, pass_cnt, curve_cov = _raster_sweep(dets_cov, runs, x0, y0, ds, gh, gw,
+                                             mask_small, n_frames)
     _check_cancel(cancel)
     coverage = float(cov.sum()) / max(1e-6, pool_area_small)
-
-    # 平均经过次数：轨迹简化后逐段栅格化
-    runs = _runs_from_detections(dets, GAP_FRAMES_MAX)
-    pc2 = np.zeros((gh, gw), np.uint16)
-    for run in runs:
-        pts_small = [(int(round((r[1] - x0) / ds)), int(round((r[2] - y0) / ds))) for r in run]
-        arr = np.array(pts_small, np.int32).reshape(-1, 1, 2)
-        if len(arr) < 2:
-            continue
-        simple = cv2.approxPolyDP(arr, max(1.0, 4.0), False).reshape(-1, 2)
-        for a, b in zip(simple[:-1], simple[1:]):
-            tmp = np.zeros((gh, gw), np.uint8)
-            r_px = max(1, int(round(math.sqrt(dets[run[0][0]]["w"] * dets[run[0][0]]["h"])
-                                    / 2.0 * SWATH_FACTOR / ds)))
-            cv2.line(tmp, (int(a[0]), int(a[1])), (int(b[0]), int(b[1])), 1,
-                     thickness=max(1, 2 * r_px))
-            tmp = (tmp > 0).astype(np.uint8) * mask_small.astype(np.uint8)
-            pc2 += tmp.astype(np.uint16)
-    pcm = pc2 > 0
-    avg_passes = float(pc2[pcm].mean()) if pcm.any() else 0.0
+    curve = [(k / fps, float(c)) for k, c in enumerate(curve_cov)]
+    pcm = pass_cnt > 0
+    avg_passes = float(pass_cnt[pcm].mean()) if pcm.any() else 0.0
+    repeat_frac = float((pass_cnt[pcm] > 1).mean()) if pcm.any() else 0.0
 
     path_len_px = 0.0
     for run in runs:
@@ -1027,9 +1260,13 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
     _progress(progress, 0.68, "生成覆盖图/热力图…")
     cov_path, heatmap_path = "", ""
     try:
-        cov_path, heatmap_path = _save_maps(out_dir, cov, pc2, mask_small, calib, (x0, y0), ds)
-    except Exception:
+        cov_path, heatmap_path = _save_maps(out_dir, cov, pass_cnt, mask_small, calib, (x0, y0), ds, coverage)
+    except Exception as exc:
         cov_path = heatmap_path = ""
+        warnings.append("覆盖图/热力图生成失败：%s" % exc)
+    for _label, _p in (("覆盖图", cov_path), ("热力图", heatmap_path)):
+        if not _p:
+            warnings.append("%s未能生成（请检查输出目录是否可写）。" % _label)
 
     # 覆盖率-真实时间 曲线图
     curve_real = [((start_sec + t * speed) if start_sec is not None else t * speed, c)
@@ -1037,18 +1274,26 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
     duration_real = (n_frames - 1) / fps * speed
     curve_path = os.path.join(out_dir, "coverage_curve.png")
     try:
-        _save_curve_chart(curve_path, curve_real, start_sec, speed, duration_real)
-    except Exception:
+        _saved = _save_curve_chart(curve_path, curve_real, start_sec, speed, duration_real)
+        if not _saved or not os.path.isfile(_saved):
+            curve_path = ""
+    except Exception as exc:
         curve_path = ""
+        warnings.append("覆盖率曲线图生成失败：%s" % exc)
+    if not curve_path:
+        warnings.append("覆盖率曲线图未能生成（请检查输出目录是否可写）。")
 
     # 完整轨迹图
     trajectory_image = os.path.join(out_dir, "trajectory.png")
     try:
         base_frame = probe_frame(video_path, 0)
-        _save_trajectory_image(trajectory_image, base_frame, calib, pts_plane,
-                               coverage, start_sec, speed, fps)
-    except Exception:
+        _saved = _save_trajectory_image(trajectory_image, base_frame, calib, pts_plane,
+                                        coverage, start_sec, speed, fps)
+        if not _saved or not os.path.isfile(_saved):
+            trajectory_image = ""
+    except Exception as exc:
         trajectory_image = ""
+        warnings.append("轨迹图生成失败：%s" % exc)
 
     # 轨迹 CSV
     traj_csv = os.path.join(out_dir, "trajectory.csv")
@@ -1061,123 +1306,31 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
                 f.write("%d,%.3f,%.1f,%.1f,%.1f,%.1f\n"
                         % (k, k / fps, d["cx"], d["cy"], d["w"], d["h"]))
 
-    # 叠加视频
-    _progress(progress, 0.72, "渲染轨迹视频…")
-    ffmpeg = _find_ffmpeg()
-    out_w = min(int(overlay_width), vw)
-    out_w -= out_w % 2
-    out_h = int(round(vh * out_w / float(vw)))
-    out_h -= out_h % 2
-    ov_path = os.path.join(out_dir, "overlay.mp4")
-    writer, ok_writer = _open_writer(ov_path, (out_w, out_h), fps, ffmpeg)
-    if not ok_writer:
-        raise RuntimeError("无法创建输出视频（缺少视频编码器）")
-    if ffmpeg is None:
-        warnings.append("未找到 ffmpeg，轨迹视频已用 MJPG/AVI 编码，兼容性略低。")
-    poly_pts = None
-    if calib.shape == SHAPE_RECT:
-        rect_pts = np.array(_order_rect_points(calib.points), np.int32)
-    elif calib.shape == SHAPE_POLY:
-        poly_pts = np.array(calib.points, np.float32).reshape(-1, 2)
+    # 叠加视频（可跳过）
+    ov_path = ""
+    if make_video:
+        ov_path = _render_overlay(video_path, dets, n_frames, fps, vw, vh, calib, curve,
+                                  out_dir, int(overlay_width), start_sec, speed, stride,
+                                  progress, cancel, warnings)
     else:
-        center, axes, angle = _ellipse_params(calib)
-    cap = cv2.VideoCapture(video_path)
-    trail_pts = []          # [(帧号, (x,y)), ...] 全程累积，每帧整条重绘
-    for k in range(n_frames):
-        ok, frame = cap.read()
-        if not ok:
-            break
-        vis = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
-        sx = out_w / float(vw)
-        if calib.shape == SHAPE_RECT:
-            cv2.polylines(vis, [(rect_pts * sx).astype(np.int32)], True, (0, 255, 255), 2)
-        elif calib.shape == SHAPE_POLY:
-            cv2.polylines(vis, [(poly_pts * sx).astype(np.int32)], True, (0, 255, 255), 2)
-        else:
-            cv2.ellipse(vis, (int(center[0] * sx), int(center[1] * sx)),
-                        (max(2, int(axes[0] / 2 * sx)), max(2, int(axes[1] / 2 * sx))),
-                        angle, 0, 360, (0, 255, 255), 2)
-        d = dets[k]
-        if d is not None:
-            x1p = int((d["cx"] - d["w"] / 2) * sx)
-            y1p = int((d["cy"] - d["h"] / 2) * sx)
-            x2p = int((d["cx"] + d["w"] / 2) * sx)
-            y2p = int((d["cy"] + d["h"] / 2) * sx)
-            cv2.rectangle(vis, (x1p, y1p), (x2p, y2p), (0, 255, 0), 2)
-            pt = (int(d["cx"] * sx), int(d["cy"] * sx))
-            trail_pts.append((k, pt))
-        # 每帧重绘完整轨迹（这才是"看到完整轨迹"）
-        if len(trail_pts) > 1:
-            for (k1, p1), (k2, p2) in zip(trail_pts[:-1], trail_pts[1:]):
-                if k2 - k1 <= GAP_FRAMES_MAX:
-                    cv2.line(vis, p1, p2, (0, 165, 255), 3, cv2.LINE_AA)
-        if trail_pts:
-            cv2.circle(vis, trail_pts[0][1], 7, (0, 200, 0), -1)
-            cv2.circle(vis, trail_pts[0][1], 7, (255, 255, 255), 2)
-        cov_now = curve[k][1]
-        cv2.putText(vis, "coverage %.1f%%" % (cov_now * 100),
-                    (max(8, out_w - 260), 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                    (255, 255, 255), 2, cv2.LINE_AA)
-        if start_sec is not None:
-            t_txt = _fmt_clock(start_sec + k / fps * speed)
-        else:
-            t_txt = "T+%.1fs" % (k / fps * speed)
-        cv2.putText(vis, t_txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                    (255, 255, 255), 2, cv2.LINE_AA)
-        _write_frame(writer, vis)
-        if k % 30 == 0:
-            _check_cancel(cancel)
-            _progress(progress, 0.72 + 0.26 * k / max(1, n_frames),
-                      "渲染轨迹视频… 第 %d/%d 帧" % (k, n_frames))
-    # 结尾定格：完整轨迹展示
-    try:
-        if trail_pts:
-            freeze = vis.copy()
-            cv2.putText(freeze, "END  full trajectory", (max(10, out_w // 2 - 150), out_h // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-            for _ in range(int(round(2.5 * fps))):
-                _write_frame(writer, freeze)
-    except Exception:
-        pass
-    cap.release()
-    ok_close = _close_writer(writer)
-    if not ok_close:
-        warnings.append("视频编码可能未完整结束，若播放异常可改用无轨迹视频。")
-    if not os.path.isfile(ov_path):
-        base = os.path.splitext(ov_path)[0]
-        for ext in (".avi", ".mp4"):
-            if os.path.isfile(base + ext):
-                ov_path = base + ext
-                break
+        warnings.append("已按设置跳过轨迹视频生成（提速）。")
 
     _progress(progress, 0.99, "保存结果…")
-    summary_path = os.path.join(out_dir, "summary.json")
     result = AnalyzeResult(
         video=video_path, out_dir=os.path.abspath(out_dir), frames=int(n_frames),
         fps=float(fps), width=int(vw), height=int(vh), detected=int(detected),
         coverage=float(coverage), uncovered=float(1.0 - coverage),
         avg_passes=float(avg_passes), pool_area_px=int(pool_area),
-        path_len_px=float(path_len_px), overlay_path=os.path.abspath(ov_path),
+        path_len_px=float(path_len_px), overlay_path=(os.path.abspath(ov_path) if ov_path else ""),
         heatmap_path=os.path.abspath(heatmap_path) if heatmap_path else "",
-        trajectory_csv=os.path.abspath(traj_csv), summary_json=os.path.abspath(summary_path),
+        trajectory_csv=os.path.abspath(traj_csv), summary_json="",
         coverage_path=os.path.abspath(cov_path) if cov_path else "",
         curve_path=os.path.abspath(curve_path) if curve_path else "",
         trajectory_image_path=os.path.abspath(trajectory_image) if trajectory_image else "",
         curve=[[float(t), float(c)] for t, c in curve],
         warnings=list(warnings),
+        shape=calib.shape,
     )
-    payload = asdict(result)
-    payload.update({
-        "version": VERSION,
-        "shape": calib.shape,
-        "calib_points": [[float(x), float(y)] for x, y in calib.points],
-        "params": {"target": target, "sensitivity": sens, "swath_factor": SWATH_FACTOR,
-                   "gap_frames": GAP_FRAMES_MAX, "pixel_basis": True,
-                   "start_time": start_time or "", "speed_factor": speed},
-        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-    })
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=1)
     _progress(progress, 1.0, "完成")
     return result
 
@@ -1253,29 +1406,92 @@ def load_template(path):
 
 
 # ---------------------------------------------------------------- 历史
+HISTORY_FILE = "_history.jsonl"
+
+
+def record_history(root_dir, result):
+    """把一次分析记录追加到输出根目录的内部索引（不再在结果目录里生成 summary.json）"""
+    try:
+        if not root_dir:
+            return ""
+        os.makedirs(root_dir, exist_ok=True)
+        curve = list(getattr(result, "curve", []) or [])
+        step = max(1, len(curve) // 200)
+        small = [[round(float(t), 3), round(float(c), 4)] for t, c in curve[::step]]
+        rec = {
+            "video": result.video,
+            "out_dir": os.path.abspath(result.out_dir),
+            "coverage": float(result.coverage),
+            "uncovered": float(getattr(result, "uncovered", 1.0 - result.coverage)),
+            "detected": int(result.detected),
+            "frames": int(result.frames),
+            "avg_passes": float(getattr(result, "avg_passes", 0.0)),
+            "shape": str(getattr(result, "shape", "")),
+            "fps": float(getattr(result, "fps", 0.0)),
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "mtime": time.time(),
+            "curve": small,
+            "overlay_path": getattr(result, "overlay_path", ""),
+            "coverage_path": getattr(result, "coverage_path", ""),
+            "heatmap_path": getattr(result, "heatmap_path", ""),
+            "curve_path": getattr(result, "curve_path", ""),
+            "trajectory_image_path": getattr(result, "trajectory_image_path", ""),
+            "warnings": list(getattr(result, "warnings", []) or []),
+        }
+        path = os.path.join(root_dir, HISTORY_FILE)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return path
+    except Exception:
+        return ""
+
+
 def list_history(root_dir):
+    """读取历史记录：优先内部索引 _history.jsonl；旧版结果目录回退读 summary.json"""
     out = []
     if not root_dir or not os.path.isdir(root_dir):
         return out
-    for name in os.listdir(root_dir):
-        d = os.path.join(root_dir, name)
-        sp = os.path.join(d, "summary.json")
-        if not os.path.isfile(sp):
-            continue
+    path = os.path.join(root_dir, HISTORY_FILE)
+    if os.path.isfile(path):
         try:
-            with open(sp, "r", encoding="utf-8") as f:
-                s = json.load(f)
-            out.append({
-                "out_dir": os.path.abspath(d),
-                "video": s.get("video", ""),
-                "coverage": float(s.get("coverage", 0.0)),
-                "detected": int(s.get("detected", 0)),
-                "frames": int(s.get("frames", 0)),
-                "shape": s.get("shape", ""),
-                "mtime": os.path.getmtime(sp),
-                "created": s.get("created", ""),
-            })
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    if not os.path.isdir(rec.get("out_dir", "")):
+                        continue
+                    rec.setdefault("mtime", 0.0)
+                    out.append(rec)
         except Exception:
-            continue
-    out.sort(key=lambda x: -x["mtime"])
+            out = []
+    if not out:  # 兼容旧版：扫描 summary.json
+        for name in os.listdir(root_dir):
+            d = os.path.join(root_dir, name)
+            sp = os.path.join(d, "summary.json")
+            if not os.path.isfile(sp):
+                continue
+            try:
+                with open(sp, "r", encoding="utf-8") as f:
+                    sm = json.load(f)
+                out.append({
+                    "out_dir": os.path.abspath(d),
+                    "video": sm.get("video", ""),
+                    "coverage": float(sm.get("coverage", 0.0)),
+                    "detected": int(sm.get("detected", 0)),
+                    "frames": int(sm.get("frames", 0)),
+                    "shape": sm.get("shape", ""),
+                    "mtime": os.path.getmtime(sp),
+                    "created": sm.get("created", ""),
+                    "curve": sm.get("curve", []),
+                })
+            except Exception:
+                continue
+    out.sort(key=lambda x: -float(x.get("mtime") or 0.0))
     return out

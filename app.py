@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""泳池机器人覆盖率分析 v0.3 —— Tkinter 桌面界面。
+"""泳池机器人覆盖率分析 v0.5.4 —— Tkinter 桌面界面。
 
 分析算法在 core.py（接口契约见 INTERFACE.md）。本模块遵守两条硬约束：
 
@@ -32,7 +32,7 @@ try:  # 缺少 core.py 时也允许 import 成功，main() 会给出中文提示
 except Exception:  # pragma: no cover - 仅在文件缺失/依赖损坏时触发
     core = None
 
-APP_TITLE = "泳池机器人覆盖率分析 v0.3"
+APP_TITLE = "泳池机器人覆盖率分析 v0.5.4"
 MIN_WINDOW_WIDTH = 900
 MIN_WINDOW_HEIGHT = 680
 
@@ -44,8 +44,20 @@ SHAPE_LABELS = {
     SHAPE_ELLIPSE: "圆形（椭圆）",
     SHAPE_POLY: "手绘自定义",
 }
-POLY_HANDLES = 12                    # 手绘轮廓最多显示的可拖动手柄数
+POLY_POINTS_MIN = 4                  # 手绘模式标定点数下限
+POLY_POINTS_MAX = 50                 # 手绘模式标定点数上限
+POLY_POINTS_DEFAULT = 8              # 手绘模式标定点数默认值
 TEMPLATES_DIR_NAME = "PoolCoverageTemplates"
+UI_CONFIG_NAME = "ui_config.json"
+
+# 轨迹视频清晰度 -> overlay_width；括号里是相对基准的提速说明
+OVERLAY_CHOICES = (
+    ("高清 1280（基准）", 1280),
+    ("标准 960（约快 20%）", 960),
+    ("快速 640（约快 35%）", 640),
+    ("极速 480（约快 45%）", 480),
+)
+OVERLAY_MAP = dict(OVERLAY_CHOICES)
 
 TARGET_LABELS = ("自动", "暗色机器人", "亮色机器人")
 TARGET_MAP = {"自动": "auto", "暗色机器人": "dark", "亮色机器人": "bright"}
@@ -103,13 +115,54 @@ def open_path(path: str) -> None:
     path = os.path.abspath(str(path))
     if not os.path.exists(path):
         raise FileNotFoundError("文件不存在：\n%s" % path)
-    if hasattr(os, "startfile"):
-        os.startfile(path)  # type: ignore[attr-defined]
-        return
     import subprocess
 
-    opener = "open" if sys.platform == "darwin" else "xdg-open"
-    subprocess.Popen([opener, path])
+    def _fallback() -> bool:
+        """系统没有关联程序时，按文件类型用 Windows 自带软件打开"""
+        if not sys.platform.startswith("win"):
+            opener = "open" if sys.platform == "darwin" else "xdg-open"
+            try:
+                subprocess.Popen([opener, path])
+                return True
+            except Exception:
+                return False
+        low = path.lower()
+        if os.path.isdir(path):
+            try:
+                subprocess.Popen(["explorer", path])
+                return True
+            except Exception:
+                return False
+        if low.endswith((".json", ".txt", ".csv", ".log", ".md")):
+            try:
+                subprocess.Popen(["notepad.exe", path])
+                return True
+            except Exception:
+                pass
+        if low.endswith((".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")):
+            try:
+                subprocess.Popen(["mspaint.exe", path])
+                return True
+            except Exception:
+                pass
+        try:  # 最后试一次资源管理器定位到文件
+            subprocess.Popen(["explorer", "/select,", path])
+            return True
+        except Exception:
+            return False
+
+    if hasattr(os, "startfile"):
+        try:
+            os.startfile(path)  # type: ignore[attr-defined]
+            return
+        except OSError:
+            if _fallback():
+                return
+            raise
+    else:
+        if _fallback():
+            return
+        raise OSError("无法打开：%s" % path)
 
 
 def _rgb_to_photo_slow(rgb) -> "tk.PhotoImage":
@@ -167,25 +220,23 @@ def frame_to_photo(frame, max_w: int, max_h: int):
     return _rgb_to_photo(rgb), disp_w, disp_h, scale
 
 
-def load_curve(out_dir: str, fallback_coverage: float = 0.0):
-    """读取某次历史记录的 summary.json 里的覆盖率曲线，返回 (点列表, 提示文字)。"""
+def curve_from_record(record, fallback_coverage=None):
+    """从 core.list_history 返回的记录里取覆盖率曲线（不读 summary.json）。
+
+    list_history 新版记录的 "curve" 字段是 [[视频秒, 覆盖率0..1], ...]；
+    旧版回退记录（读 summary.json 的兼容路径）也带 curve。缺失时按最终覆盖率画平线。
+    """
+    if not isinstance(record, dict):
+        record = {}
+    coverage = fallback_coverage
+    if coverage is None:
+        try:
+            coverage = float(record.get("coverage") or 0.0)
+        except (TypeError, ValueError):
+            coverage = 0.0
+    raw = record.get("curve")
     points = []
-    note = ""
-    path = os.path.join(out_dir or "", "summary.json")
-    data = None
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
-        note = "读取 summary.json 失败，按最终覆盖率画平线"
-    raw = None
-    if isinstance(data, dict):
-        for key in ("curve", "coverage_curve", "coverageCurve"):
-            value = data.get(key)
-            if isinstance(value, list) and value:
-                raw = value
-                break
-    if raw:
+    if isinstance(raw, list):
         for item in raw:
             t = c = None
             if isinstance(item, (list, tuple)) and len(item) >= 2:
@@ -208,11 +259,9 @@ def load_curve(out_dir: str, fallback_coverage: float = 0.0):
                 continue
             points.append((t, min(1.0, max(0.0, c))))
         points.sort(key=lambda p: p[0])
-    if not points:
-        points = [(0.0, float(fallback_coverage or 0.0))]
-        if not note:
-            note = "该记录没有曲线数据，按最终覆盖率画平线"
-    return points, note
+    if points:
+        return points, ""
+    return [(0.0, float(coverage or 0.0))], "该记录没有曲线数据，按最终覆盖率画平线"
 
 
 # ============================================================ 标定窗口
@@ -239,6 +288,9 @@ class CalibrationDialog(tk.Toplevel):
         self._contour = []    # 当前平滑闭合轮廓（原图坐标）
         self._drag_handle = None
         self._drawing = False
+        self._press_xy = None      # 本次按下的画布坐标（判断单击点选 vs 拖动描边）
+        self._press_moved = False
+        self._poly_mode = None     # None / "click"（依次点选）/ "stroke"（拖动描边）
         self._photo = None
         self._scale = 1.0
         self._busy = False
@@ -289,6 +341,23 @@ class CalibrationDialog(tk.Toplevel):
                                         command=self._on_snap_toggle)
         self.chk_snap.grid(row=0, column=3, sticky="w")
         self.scale_strength.bind("<ButtonRelease-1>", self._on_strength_release)
+
+        # 标定点数：单击依次点选最多 N 个点；拖动描边时也按 N 取控制点/手柄
+        ttk.Label(self.poly_opts, text="标定点数：").grid(row=1, column=0, sticky="w",
+                                                       pady=(4, 0))
+        self.var_poly_n = tk.DoubleVar(value=float(POLY_POINTS_DEFAULT))
+        self.scale_poly_n = ttk.Scale(self.poly_opts, from_=POLY_POINTS_MIN,
+                                      to=POLY_POINTS_MAX, length=180,
+                                      variable=self.var_poly_n,
+                                      command=self._on_poly_n_changed)
+        self.scale_poly_n.grid(row=1, column=1, sticky="w", pady=(4, 0))
+        self.var_poly_n_text = tk.StringVar(value=str(POLY_POINTS_DEFAULT))
+        ttk.Label(self.poly_opts, textvariable=self.var_poly_n_text, width=5).grid(
+            row=1, column=2, sticky="w", padx=(6, 18), pady=(4, 0))
+        ttk.Label(self.poly_opts, text="%d～%d 个（不规则池子可多设几个）"
+                                       % (POLY_POINTS_MIN, POLY_POINTS_MAX),
+                  style="Hint.TLabel").grid(row=1, column=3, sticky="w", pady=(4, 0))
+        self.scale_poly_n.bind("<ButtonRelease-1>", self._on_poly_n_release)
         if self._shape == SHAPE_POLY:
             self.poly_opts.pack(fill="x", pady=(0, 6))
 
@@ -307,7 +376,8 @@ class CalibrationDialog(tk.Toplevel):
             pts = [(float(p[0]), float(p[1])) for p in getattr(initial, "points", [])]
             if self._shape == SHAPE_POLY:
                 if len(pts) >= 3:
-                    self._handles = self._resample_handles(pts, POLY_HANDLES)
+                    self._poly_mode = "stroke"
+                    self._handles = self._resample_handles(pts, self._point_count())
                     self._refresh_contour(live=False)
             elif len(pts) == self._required:
                 self._points = pts
@@ -348,6 +418,14 @@ class CalibrationDialog(tk.Toplevel):
         self._redraw()
 
     # -------------------------------------------------- 交互（手绘自定义）
+    def _point_count(self) -> int:
+        """当前「标定点数」滑杆值（4~50 整数）"""
+        try:
+            value = int(round(float(self.var_poly_n.get())))
+        except (tk.TclError, ValueError):
+            value = POLY_POINTS_DEFAULT
+        return max(POLY_POINTS_MIN, min(POLY_POINTS_MAX, value))
+
     def _poly_press(self, event):
         if self._busy:
             return
@@ -358,12 +436,12 @@ class CalibrationDialog(tk.Toplevel):
                 if math.hypot(event.x - dx, event.y - dy) <= 9:
                     self._drag_handle = index
                     return
-        # 否则开始新的一笔（已有轮廓会被替换，可用“重画”清空）
+        # 先记录按下位置，松手时再判断是「单击点选」还是「拖动描边」
         self._drag_handle = None
-        self._raw = [self._to_original(event.x, event.y)]
-        self._handles = []
-        self._contour = []
+        self._press_xy = (event.x, event.y)
+        self._press_moved = False
         self._drawing = True
+        self._raw = []
         self._redraw()
 
     def _poly_motion(self, event):
@@ -376,6 +454,18 @@ class CalibrationDialog(tk.Toplevel):
             self._redraw()
             return
         if not self._drawing:
+            return
+        if not self._press_moved:
+            px, py = self._press_xy or (event.x, event.y)
+            if math.hypot(event.x - px, event.y - py) < 4:
+                return
+            # 移动超过 4 像素 → 视为拖动描边，重新开始一笔
+            self._press_moved = True
+            self._poly_mode = "stroke"
+            self._handles = []
+            self._contour = []
+            self._raw = [self._to_original(px, py), self._to_original(event.x, event.y)]
+            self._redraw()
             return
         x, y = self._to_original(event.x, event.y)
         if self._raw:
@@ -397,6 +487,12 @@ class CalibrationDialog(tk.Toplevel):
         if not self._drawing:
             return
         self._drawing = False
+        press_xy, self._press_xy = self._press_xy, None
+        if not self._press_moved:
+            # 没有拖动就是单击点选
+            if press_xy is not None:
+                self._add_click_point(press_xy)
+            return
         if len(self._raw) < 3:
             self._reset_poly()
             self._redraw()
@@ -412,10 +508,26 @@ class CalibrationDialog(tk.Toplevel):
         try:
             contour = core.smooth_contour([list(p) for p in self._raw],
                                           float(self.var_strength.get()))
-            self._handles = self._resample_handles(contour, POLY_HANDLES)
+            self._handles = self._resample_handles(contour, self._point_count())
         except Exception:
-            self._handles = self._resample_handles(self._raw, POLY_HANDLES)
+            self._handles = self._resample_handles(self._raw, self._point_count())
+        self._poly_mode = "stroke"
         self._refresh_contour(live=False)
+        self._redraw()
+
+    def _add_click_point(self, disp_xy):
+        """单击依次点选：追加一个标定点；点满 N 个自动闭合，≥4 个即可确定。"""
+        if self._poly_mode == "stroke":
+            self._update_hint()
+            return
+        count = self._point_count()
+        self._poly_mode = "click"
+        if len(self._handles) >= count:
+            self._update_hint()
+            return
+        self._handles.append(self._to_original(disp_xy[0], disp_xy[1]))
+        if len(self._handles) >= POLY_POINTS_MIN:
+            self._refresh_contour(live=False)
         self._redraw()
 
     def _reset_poly(self):
@@ -424,6 +536,9 @@ class CalibrationDialog(tk.Toplevel):
         self._contour = []
         self._drag_handle = None
         self._drawing = False
+        self._press_xy = None
+        self._press_moved = False
+        self._poly_mode = None
 
     def _min_poly_area(self) -> float:
         return max(64.0, 1e-4 * float(self._frame_w * self._frame_h))
@@ -441,7 +556,7 @@ class CalibrationDialog(tk.Toplevel):
         return abs(area) / 2.0
 
     @staticmethod
-    def _resample_handles(points, count: int = POLY_HANDLES):
+    def _resample_handles(points, count: int = POLY_POINTS_DEFAULT):
         """沿闭合轮廓按弧长等距取最多 count 个控制点（原图坐标）。"""
         pts = [(float(p[0]), float(p[1])) for p in points]
         n = len(pts)
@@ -512,6 +627,33 @@ class CalibrationDialog(tk.Toplevel):
             self._refresh_contour(live=False)
             self._redraw()
 
+    def _on_poly_n_changed(self, _value=None):
+        count = self._point_count()
+        self.var_poly_n_text.set(str(count))
+        if self._shape != SHAPE_POLY:
+            return
+        if self._poly_mode == "stroke" and self._handles:
+            # 拖动描边：按新的标定点数重新取控制点（保持整体轮廓）
+            base = self._contour if self._contour else self._handles
+            self._handles = self._resample_handles(base, count)
+            self._refresh_contour(live=True)
+            self._redraw()
+        elif self._poly_mode == "click" and self._handles:
+            if len(self._handles) > count:
+                self._handles = self._handles[:count]
+            if len(self._handles) >= POLY_POINTS_MIN:
+                self._refresh_contour(live=True)
+            else:
+                self._contour = []
+            self._redraw()
+        else:
+            self._update_hint()
+
+    def _on_poly_n_release(self, _event=None):
+        if self._shape == SHAPE_POLY and self._handles:
+            self._refresh_contour(live=False)
+            self._redraw()
+
     def _on_snap_toggle(self):
         if self._shape == SHAPE_POLY and self._handles:
             self._refresh_contour(live=False)
@@ -538,6 +680,7 @@ class CalibrationDialog(tk.Toplevel):
         try:
             self.scale_strength.configure(state=state)
             self.chk_snap.configure(state=state)
+            self.scale_poly_n.configure(state=state)
         except (tk.TclError, AttributeError):
             pass
         if busy:
@@ -561,7 +704,8 @@ class CalibrationDialog(tk.Toplevel):
             return
         self._set_busy(False)
         if self._shape == SHAPE_POLY:
-            self._handles = self._resample_handles(points, POLY_HANDLES)
+            self._poly_mode = "stroke"
+            self._handles = self._resample_handles(points, self._point_count())
             self._refresh_contour(live=False)
             self._redraw()
             return
@@ -579,9 +723,15 @@ class CalibrationDialog(tk.Toplevel):
         if self._shape == SHAPE_POLY:
             self._refresh_contour(live=False)
             contour = self._contour
+            if len(self._handles) < POLY_POINTS_MIN:
+                messagebox.showwarning(
+                    "标定未完成",
+                    "手绘轮廓至少需要 %d 个点：可依次单击点选，或按住左键拖动描一圈。"
+                    % POLY_POINTS_MIN, parent=self)
+                return
             if len(contour) < 3:
                 messagebox.showwarning(
-                    "标定未完成", "请先在画面上按住左键拖动，描出池底轮廓。", parent=self)
+                    "标定未完成", "轮廓还没闭合，请继续点选或拖动描边。", parent=self)
                 return
             if self._contour_area(contour) < self._min_poly_area():
                 messagebox.showwarning("轮廓太小", "描出的区域太小，请重新描。", parent=self)
@@ -644,8 +794,16 @@ class CalibrationDialog(tk.Toplevel):
                 coords.extend([dx, dy])
             self.canvas.create_polygon(coords, outline="#69f0ae", fill="", width=3,
                                        tags="mk")
-        # ≤12 个可拖动手柄
-        if self._handles and not self._drawing:
+        # 点选模式还没闭合时：连线显示已点的标定点
+        if self._poly_mode == "click" and len(self._contour) < 3 and len(self._handles) >= 2:
+            coords = []
+            for hx, hy in self._handles:
+                dx, dy = self._to_display(hx, hy)
+                coords.extend([dx, dy])
+            self.canvas.create_line(coords, fill="#ffd740", width=2, dash=(6, 3),
+                                    tags="mk")
+        # ≤ N 个可拖动手柄
+        if self._handles and not (self._drawing and self._press_moved):
             for hx, hy in self._handles:
                 dx, dy = self._to_display(hx, hy)
                 r = 5
@@ -713,13 +871,30 @@ class CalibrationDialog(tk.Toplevel):
 
     def _update_hint(self):
         if self._shape == SHAPE_POLY:
-            if self._drawing:
+            count = self._point_count()
+            if self._drawing and self._press_moved:
                 text = "正在描边…已采集 %d 个点（松开左键自动闭合）" % len(self._raw)
+            elif self._drawing:
+                text = ("手绘模式：单击依次点选标定点，或按住左键拖动描一圈（约 %d 个点）"
+                        % count)
+            elif self._poly_mode == "click" and self._handles:
+                n = len(self._handles)
+                if n >= count:
+                    text = ("已点满 %d/%d 个点（已自动闭合）：可拖动黄色手柄修正，"
+                            "或点“确定”" % (n, count))
+                elif n >= POLY_POINTS_MIN:
+                    text = ("已点 %d/%d 个点：可继续点满、拖动黄色手柄修正，"
+                            "或直接点“确定”" % (n, count))
+                else:
+                    text = ("已点 %d/%d 个点：至少点 %d 个才能确定；也可按住左键拖动描边"
+                            % (n, count, POLY_POINTS_MIN))
             elif self._handles:
-                text = ("已闭合：绿色为平滑轮廓，可拖动黄色手柄微调，满意后点“确定”"
-                        "（共 %d 个控制点）" % len(self._handles))
+                text = ("已闭合（%d 个控制点）：绿色为平滑轮廓，可拖动黄色手柄微调，"
+                        "点“确定”" % len(self._handles))
             else:
-                text = "手绘模式：按住鼠标左键，沿池底边缘描一圈，松手自动闭合"
+                text = ("手绘模式：单击依次点选标定点（默认 %d 个，≥%d 个可确定，"
+                        "点满自动闭合），或按住左键拖动描一圈"
+                        % (count, POLY_POINTS_MIN))
             self.var_hint.set(text)
             return
         n = len(self._points)
@@ -743,6 +918,86 @@ class CalibrationDialog(tk.Toplevel):
 
 
 # ============================================================ 历史对比窗口
+class ImageViewDialog(tk.Toplevel):
+    """程序内置的图片查看窗口：不依赖 Windows 的 .png 文件关联。"""
+
+    MAX_W_RATIO = 0.9
+    MAX_H_RATIO = 0.82
+
+    def __init__(self, master, path: str, title: str = "图片"):
+        super().__init__(master)
+        self.withdraw()
+        self.title(title)
+        self.path = path
+        self._photo = None
+        self._image = None
+
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        max_w = max(480, int(screen_w * self.MAX_W_RATIO))
+        max_h = max(320, int(screen_h * self.MAX_H_RATIO))
+
+        try:
+            self._photo, disp_w, disp_h = load_photo_for_viewer(path, max_w, max_h)
+        except Exception as exc:
+            self.destroy()
+            raise RuntimeError("无法读取图片（%s）：%s" % (os.path.basename(path), exc))
+
+        outer = ttk.Frame(self, padding=10)
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, width=disp_w, height=disp_h, bg="#101010",
+                           highlightthickness=1, highlightbackground="#666666")
+        canvas.pack()
+        canvas.create_image(0, 0, anchor="nw", image=self._photo)
+
+        bar = ttk.Frame(outer)
+        bar.pack(fill="x", pady=(8, 0))
+        ttk.Label(bar, text="%s  ·  %d × %d" % (os.path.basename(path), disp_w, disp_h),
+                  style="Hint.TLabel").pack(side="left")
+        ttk.Button(bar, text="用系统程序打开", width=16,
+                   command=self._open_system).pack(side="right", padx=4)
+        ttk.Button(bar, text="打开所在文件夹", width=14,
+                   command=self._open_folder).pack(side="right", padx=4)
+        ttk.Button(bar, text="关闭", width=8,
+                   command=self.destroy).pack(side="right", padx=4)
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.deiconify()
+
+    def _open_system(self):
+        try:
+            open_path(self.path)
+        except Exception as exc:
+            messagebox.showerror("打开失败", "无法用系统程序打开：\n%s" % exc, parent=self)
+
+    def _open_folder(self):
+        try:
+            open_path(os.path.dirname(self.path))
+        except Exception as exc:
+            messagebox.showerror("打开失败", "无法打开文件夹：\n%s" % exc, parent=self)
+
+
+def load_photo_for_viewer(path: str, max_w: int, max_h: int):
+    """读图片并缩放到画布内，返回 (PhotoImage, 宽, 高)"""
+    try:
+        from PIL import Image, ImageTk  # type: ignore
+        im = Image.open(path)
+        im = im.convert("RGB") if im.mode not in ("RGB", "L") else im
+        w, h = im.size
+        scale = min(max_w / float(w), max_h / float(h), 1.0)
+        if scale < 1.0:
+            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        return ImageTk.PhotoImage(im), int(im.size[0]), int(im.size[1])
+    except Exception:
+        pass
+    # 无 Pillow 时的兜底：Tk 8.6 自带 PNG 支持 + 整数降采样
+    photo = tk.PhotoImage(file=path)
+    w, h = photo.width(), photo.height()
+    k = max(1, int(math.ceil(max(w / float(max_w), h / float(max_h)))))
+    if k > 1:
+        photo = photo.subsample(k, k)
+    return photo, photo.width(), photo.height()
+
+
 class CompareDialog(tk.Toplevel):
     """两条历史记录的覆盖率曲线对比。"""
 
@@ -756,7 +1011,7 @@ class CompareDialog(tk.Toplevel):
         self._curves = []
         self._notes = []
         for rec in self._records:
-            pts, note = load_curve(str(rec.get("out_dir") or ""), rec.get("coverage") or 0.0)
+            pts, note = curve_from_record(rec)
             self._curves.append(pts)
             self._notes.append(note)
         self._build()
@@ -780,6 +1035,8 @@ class CompareDialog(tk.Toplevel):
                 ("视频", os.path.basename(str(rec.get("video") or "（未知）"))),
                 ("时间", str(rec.get("created") or format_clock(rec.get("mtime")))),
                 ("覆盖率", percent_text(rec.get("coverage") or 0.0)),
+                ("漏洗面积", percent_text(rec.get("uncovered") or 0.0)),
+                ("平均经过次数", "%.2f 次" % float(rec.get("avg_passes") or 0.0)),
                 ("检测命中率", "%s（%d/%d 帧）" % (percent_text(hit), detected, frames_total)),
             )
             for r, (key, value) in enumerate(rows):
@@ -877,7 +1134,8 @@ class PoolCoverageApp:
         self.root.geometry("%dx%d" % (1080, 860))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self.reports_root = default_reports_root()
+        self.config_path = os.path.join(app_dir(), UI_CONFIG_NAME)
+        self.reports_root = self._load_output_root()
         self.templates_root = os.path.join(app_dir(), TEMPLATES_DIR_NAME)
         self.video_path = ""
         self._calib = None
@@ -893,6 +1151,9 @@ class PoolCoverageApp:
         self._templates = []
         self._last_start_time = ""
         self._last_speed = 1.0
+        self._last_overlay_width = OVERLAY_CHOICES[0][1]
+        self._last_make_video = True
+        self._last_overlay_label = OVERLAY_CHOICES[0][0]
 
         self._setup_fonts()
         self._build_ui()
@@ -943,6 +1204,22 @@ class PoolCoverageApp:
         self.var_video_info = tk.StringVar(value="尚未选择视频。支持 mp4 / avi / mov / mkv 等常见格式。")
         ttk.Label(video_box, textvariable=self.var_video_info, style="Hint.TLabel").grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        # 输出目录：默认 exe 旁边 PoolCoverageReports，可改并记住
+        out_frame = ttk.Frame(video_box)
+        out_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        out_frame.columnconfigure(1, weight=1)
+        ttk.Label(out_frame, text="输出目录：").grid(row=0, column=0, sticky="w")
+        self.var_out_root = tk.StringVar(value=self.reports_root)
+        self.ent_out_root = ttk.Entry(out_frame, textvariable=self.var_out_root,
+                                      state="readonly")
+        self.ent_out_root.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        self.btn_choose_out = ttk.Button(out_frame, text="选择…", width=8,
+                                         command=self._choose_output_dir)
+        self.btn_choose_out.grid(row=0, column=2, padx=(0, 6))
+        self.btn_reset_out = ttk.Button(out_frame, text="恢复默认", width=10,
+                                        command=self._reset_output_dir)
+        self.btn_reset_out.grid(row=0, column=3)
         row += 1
 
         # ---- 2. 池型与标定
@@ -1041,6 +1318,26 @@ class PoolCoverageApp:
                   text="视频是加速的填倍速：2 小时压成 2 分钟填 60；原速填 1.0。",
                   style="Hint.TLabel").grid(row=3, column=2, columnspan=4, sticky="w",
                                             pady=(4, 0))
+
+        # ---- 3c. 提速选项：轨迹视频清晰度 / 不生成视频
+        ttk.Label(param_box, text="轨迹视频清晰度：").grid(row=4, column=0, sticky="w",
+                                                    pady=(6, 0))
+        self.var_overlay = tk.StringVar(value=OVERLAY_CHOICES[0][0])
+        self.combo_overlay = ttk.Combobox(
+            param_box, textvariable=self.var_overlay,
+            values=[choice[0] for choice in OVERLAY_CHOICES],
+            state="readonly", width=21)
+        self.combo_overlay.grid(row=4, column=1, columnspan=2, sticky="w", padx=(0, 18),
+                                pady=(6, 0))
+        self.var_skip_video = tk.BooleanVar(value=False)
+        self.chk_skip_video = ttk.Checkbutton(
+            param_box, text="不生成轨迹视频（约快 40%）",
+            variable=self.var_skip_video, command=self._on_skip_video_toggle)
+        self.chk_skip_video.grid(row=4, column=3, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(param_box,
+                  text="清晰度越低、越不出视频，分析越快；覆盖率/覆盖图/热力图/曲线不受影响。",
+                  style="Hint.TLabel").grid(row=5, column=0, columnspan=6, sticky="w",
+                                            pady=(4, 0))
         row += 1
 
         # ---- 4. 开始/取消 + 进度
@@ -1091,11 +1388,7 @@ class PoolCoverageApp:
                                    state="disabled",
                                    command=lambda: self._open_result("overlay_path",
                                                                      "轨迹视频"))
-        self.btn_summary = ttk.Button(btn_frame, text="打开 summary.json", width=17,
-                                      state="disabled",
-                                      command=lambda: self._open_result("summary_json",
-                                                                        "summary.json"))
-        for index, btn in enumerate((self.btn_open_dir, self.btn_play, self.btn_summary)):
+        for index, btn in enumerate((self.btn_open_dir, self.btn_play)):
             btn.grid(row=0, column=index, padx=(0, 8))
 
         # ---- 结果图片：覆盖图 / 热力图 / 覆盖率曲线 / 完整轨迹图
@@ -1168,9 +1461,65 @@ class PoolCoverageApp:
         self.tree.bind("<<TreeviewSelect>>", self._on_history_selected)
         row += 1
 
-        # ---- 底部状态
-        ttk.Label(main, text="输出目录：%s" % self.reports_root,
-                  style="Hint.TLabel").grid(row=row, column=0, sticky="w", pady=(6, 0))
+    # -------------------------------------------------- 输出目录 / UI 配置
+    def _load_output_root(self) -> str:
+        """读取 ui_config.json 里记住的输出目录；读不到/无效时用默认目录。"""
+        default = default_reports_root()
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as fh:
+                config = json.load(fh)
+            path = str(config.get("output_dir") or "").strip()
+            if path:
+                path = os.path.abspath(os.path.expanduser(path))
+                if os.path.isdir(path) or os.path.isdir(os.path.dirname(path)):
+                    return path
+        except Exception:
+            pass
+        return default
+
+    def _save_output_root(self):
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as fh:
+                json.dump({"output_dir": self.reports_root}, fh, ensure_ascii=False,
+                          indent=1)
+        except Exception:
+            pass  # 配置写不进去不影响使用
+
+    def _set_output_root(self, path: str):
+        self.reports_root = os.path.abspath(path)
+        self.var_out_root.set(self.reports_root)
+        self.var_result_note.set("输出目录：%s" % self.reports_root)
+        self._save_output_root()
+        self._refresh_history()
+        self._set_status("输出目录：%s" % self.reports_root)
+
+    def _choose_output_dir(self):
+        if self._analyzing:
+            return
+        path = filedialog.askdirectory(title="选择输出根目录",
+                                       initialdir=self.reports_root)
+        if not path:
+            return
+        path = os.path.abspath(path)
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("无法使用该目录",
+                                 "无法创建/使用输出目录：\n%s\n\n%s" % (path, exc))
+            return
+        self._set_output_root(path)
+
+    def _reset_output_dir(self):
+        if self._analyzing:
+            return
+        default = default_reports_root()
+        try:
+            os.makedirs(default, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("无法恢复默认目录",
+                                 "无法创建默认输出目录：\n%s\n\n%s" % (default, exc))
+            return
+        self._set_output_root(default)
 
     # -------------------------------------------------- 小回调
     def _on_sensitivity(self, _value=None):
@@ -1178,6 +1527,15 @@ class PoolCoverageApp:
             self.var_sens_text.set("%.2f" % float(self.var_sensitivity.get()))
         except (tk.TclError, ValueError):
             pass
+
+    def _on_skip_video_toggle(self):
+        """勾选「不生成轨迹视频」时，清晰度下拉置灰（分析中保持禁用）。"""
+        if self._analyzing:
+            return
+        if self.var_skip_video.get():
+            self.combo_overlay.configure(state="disabled")
+        else:
+            self.combo_overlay.configure(state="readonly")
 
     def _set_status(self, text: str):
         self.var_status.set(text)
@@ -1447,6 +1805,8 @@ class PoolCoverageApp:
             sensitivity = min(1.0, max(0.0, float(self.var_sensitivity.get())))
         except (tk.TclError, ValueError):
             sensitivity = 0.5
+        overlay_width = OVERLAY_MAP.get(self.var_overlay.get(), OVERLAY_CHOICES[0][1])
+        make_video = not bool(self.var_skip_video.get())
         # 真实时间参数：非法也给提示，但按默认值继续（空起始时间=相对时间，倍速 1.0）
         start_time, time_ok = self._validated_start_time()
         if not time_ok:
@@ -1471,6 +1831,9 @@ class PoolCoverageApp:
         self._result = None
         self._last_start_time = start_time
         self._last_speed = speed_factor
+        self._last_overlay_width = overlay_width
+        self._last_make_video = make_video
+        self._last_overlay_label = self.var_overlay.get()
         self.var_cov.set("—")
         self.var_uncovered.set("—")
         self.var_passes.set("—")
@@ -1486,7 +1849,7 @@ class PoolCoverageApp:
         self._worker = threading.Thread(
             target=self._worker_run,
             args=(video, self._calib, out_dir, target, sensitivity,
-                  start_time, speed_factor),
+                  start_time, speed_factor, overlay_width, make_video),
             name="PoolCoverageAnalyze",
             daemon=True,
         )
@@ -1510,7 +1873,7 @@ class PoolCoverageApp:
         return out_dir
 
     def _worker_run(self, video, calib, out_dir, target, sensitivity,
-                    start_time, speed_factor):
+                    start_time, speed_factor, overlay_width, make_video):
         """后台线程：只调用 core，不碰任何 Tk 控件，全部结果走 queue。"""
         try:
             result = core.analyze(
@@ -1521,6 +1884,8 @@ class PoolCoverageApp:
                 cancel=self._cancel_event.is_set,
                 start_time=(start_time or None),
                 speed_factor=speed_factor,
+                overlay_width=overlay_width,
+                make_video=make_video,
             )
             self._queue.put(("result", result))
         except BaseException as exc:  # noqa: BLE001 - 线程里必须兜住一切
@@ -1608,6 +1973,10 @@ class PoolCoverageApp:
                          % (self._last_start_time, self._last_speed))
         else:
             notes.append("曲线横轴：相对时间（填了起始时间后可选真实时间）")
+        if self._last_make_video:
+            notes.append("轨迹视频：%s" % self._last_overlay_label)
+        else:
+            notes.append("轨迹视频：已按设置跳过生成（提速）")
         warnings = list(getattr(result, "warnings", []) or [])
         if warnings:
             notes.append("提示：" + "；".join(str(w) for w in warnings))
@@ -1616,6 +1985,13 @@ class PoolCoverageApp:
         self.progress.configure(value=100.0)
         self._set_status("分析完成：覆盖率 %s，漏洗 %s。"
                          % (percent_text(coverage), percent_text(uncovered)))
+        # 记录到输出根目录的内部历史索引（新版不再生成 summary.json）
+        recorder = getattr(core, "record_history", None)
+        if recorder is not None:
+            try:
+                recorder(self.reports_root, result)
+            except Exception:
+                pass
         self._refresh_history()
 
     def _on_error(self, message, traceback_text=""):
@@ -1646,12 +2022,17 @@ class PoolCoverageApp:
         self._analyzing = analyzing
         state = "disabled" if analyzing else "normal"
         for widget in (self.btn_browse, self.rb_rect, self.rb_ellipse, self.rb_poly,
-                       self.btn_calibrate, self.btn_start):
+                       self.btn_calibrate, self.btn_start,
+                       self.btn_choose_out, self.btn_reset_out, self.chk_skip_video):
             widget.configure(state=state)
         for widget in (self.btn_tpl_apply, self.btn_tpl_save, self.btn_tpl_delete):
             widget.configure(state=state)
         self.combo_template.configure(state="disabled" if analyzing else "readonly")
         self.combo_target.configure(state="disabled" if analyzing else "readonly")
+        if analyzing or self.var_skip_video.get():
+            self.combo_overlay.configure(state="disabled")
+        else:
+            self.combo_overlay.configure(state="readonly")
         self.scale_sens.configure(state="disabled" if analyzing else "normal")
         self.ent_start_time.configure(state=state)
         self.ent_speed.configure(state=state)
@@ -1670,7 +2051,6 @@ class PoolCoverageApp:
         return (
             (self.btn_open_dir, "out_dir"),
             (self.btn_play, "overlay_path"),
-            (self.btn_summary, "summary_json"),
             (self.btn_coverage, "coverage_path"),
             (self.btn_heatmap, "heatmap_path"),
             (self.btn_curve, "curve_path"),
@@ -1692,6 +2072,13 @@ class PoolCoverageApp:
         if not path:
             messagebox.showinfo("暂无文件", "本次结果没有生成%s。" % label)
             return
+        if os.path.splitext(path)[1].lower() in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"):
+            try:
+                ImageViewDialog(self.root, path, title=label)
+                return
+            except Exception as exc:
+                messagebox.showerror("查看失败", "无法查看%s：\n%s" % (label, exc))
+                return
         try:
             open_path(path)
         except Exception as exc:
