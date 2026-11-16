@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""泳池机器人覆盖率分析 v0.1 —— Tkinter 桌面界面。
+"""泳池机器人覆盖率分析 v0.2 —— Tkinter 桌面界面。
 
 分析算法在 core.py（接口契约见 INTERFACE.md）。本模块遵守两条硬约束：
 
@@ -25,20 +25,27 @@ import traceback
 import tkinter as tk
 from tkinter import filedialog
 from tkinter import font as tkfont
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 try:  # 缺少 core.py 时也允许 import 成功，main() 会给出中文提示
     import core
 except Exception:  # pragma: no cover - 仅在文件缺失/依赖损坏时触发
     core = None
 
-APP_TITLE = "泳池机器人覆盖率分析 v0.1"
+APP_TITLE = "泳池机器人覆盖率分析 v0.2"
 MIN_WINDOW_WIDTH = 900
 MIN_WINDOW_HEIGHT = 680
 
 SHAPE_RECT = "rect"
 SHAPE_ELLIPSE = "ellipse"
-SHAPE_LABELS = {SHAPE_RECT: "矩形", SHAPE_ELLIPSE: "圆形（椭圆）"}
+SHAPE_POLY = "poly"
+SHAPE_LABELS = {
+    SHAPE_RECT: "矩形",
+    SHAPE_ELLIPSE: "圆形（椭圆）",
+    SHAPE_POLY: "手绘自定义",
+}
+POLY_HANDLES = 12                    # 手绘轮廓最多显示的可拖动手柄数
+TEMPLATES_DIR_NAME = "PoolCoverageTemplates"
 
 TARGET_LABELS = ("自动", "暗色机器人", "亮色机器人")
 TARGET_MAP = {"自动": "auto", "暗色机器人": "dark", "亮色机器人": "bright"}
@@ -220,7 +227,16 @@ class CalibrationDialog(tk.Toplevel):
         self._video_path = video_path
         self._shape = shape
         self._required = 4 if shape == SHAPE_RECT else 3
-        self._points = []  # 原视频像素坐标
+        if shape == SHAPE_POLY:
+            self._required = None  # 手绘模式点数不固定
+        self._points = []  # 原视频像素坐标（矩形/圆形）
+        self._frame = frame  # 原图 BGR，边缘吸附时使用
+        self._frame_h, self._frame_w = frame.shape[:2]
+        self._raw = []        # 手绘原始笔迹（原图坐标）
+        self._handles = []    # ≤12 个可拖动控制点（原图坐标）
+        self._contour = []    # 当前平滑闭合轮廓（原图坐标）
+        self._drag_handle = None
+        self._drawing = False
         self._photo = None
         self._scale = 1.0
         self._busy = False
@@ -243,15 +259,41 @@ class CalibrationDialog(tk.Toplevel):
                                 cursor="crosshair")
         self.canvas.pack()
         self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
-        self.canvas.bind("<Button-1>", self._on_click)
+        if self._shape == SHAPE_POLY:
+            self.canvas.bind("<Button-1>", self._poly_press)
+            self.canvas.bind("<B1-Motion>", self._poly_motion)
+            self.canvas.bind("<ButtonRelease-1>", self._poly_release)
+        else:
+            self.canvas.bind("<Button-1>", self._on_click)
 
         self.var_hint = tk.StringVar(value="")
         ttk.Label(outer, textvariable=self.var_hint, foreground="#333333").pack(
             fill="x", pady=(8, 6))
 
+        # ---- 手绘模式专用选项（其它池型隐藏）
+        self.poly_opts = ttk.Frame(outer)
+        ttk.Label(self.poly_opts, text="平滑强度：").grid(row=0, column=0, sticky="w")
+        self.var_strength = tk.DoubleVar(value=1.0)
+        self.scale_strength = ttk.Scale(self.poly_opts, from_=0.0, to=2.0, length=180,
+                                        variable=self.var_strength,
+                                        command=self._on_strength_changed)
+        self.scale_strength.grid(row=0, column=1, sticky="w")
+        self.var_strength_text = tk.StringVar(value="1.00")
+        ttk.Label(self.poly_opts, textvariable=self.var_strength_text, width=5).grid(
+            row=0, column=2, sticky="w", padx=(6, 18))
+        self.var_snap = tk.BooleanVar(value=False)
+        self.chk_snap = ttk.Checkbutton(self.poly_opts, text="吸附边缘（可选，默认关）",
+                                        variable=self.var_snap,
+                                        command=self._on_snap_toggle)
+        self.chk_snap.grid(row=0, column=3, sticky="w")
+        self.scale_strength.bind("<ButtonRelease-1>", self._on_strength_release)
+        if self._shape == SHAPE_POLY:
+            self.poly_opts.pack(fill="x", pady=(0, 6))
+
         buttons = ttk.Frame(outer)
         buttons.pack()
-        self.btn_clear = ttk.Button(buttons, text="清除", width=10, command=self._clear)
+        clear_text = "重画" if self._shape == SHAPE_POLY else "清除"
+        self.btn_clear = ttk.Button(buttons, text=clear_text, width=10, command=self._clear)
         self.btn_auto = ttk.Button(buttons, text="自动识别", width=12,
                                    command=self._auto_detect)
         self.btn_ok = ttk.Button(buttons, text="确定", width=10, command=self._confirm)
@@ -261,7 +303,11 @@ class CalibrationDialog(tk.Toplevel):
 
         if initial is not None and getattr(initial, "shape", None) == shape:
             pts = [(float(p[0]), float(p[1])) for p in getattr(initial, "points", [])]
-            if len(pts) == self._required:
+            if self._shape == SHAPE_POLY:
+                if len(pts) >= 3:
+                    self._handles = self._resample_handles(pts, POLY_HANDLES)
+                    self._refresh_contour(live=False)
+            elif len(pts) == self._required:
                 self._points = pts
 
         self.bind("<Escape>", lambda _e: self.destroy())
@@ -289,7 +335,7 @@ class CalibrationDialog(tk.Toplevel):
     def _to_display(self, x: float, y: float):
         return float(x) * self._scale, float(y) * self._scale
 
-    # -------------------------------------------------- 交互
+    # -------------------------------------------------- 交互（矩形 / 圆形）
     def _on_click(self, event):
         if self._busy:
             return
@@ -299,10 +345,183 @@ class CalibrationDialog(tk.Toplevel):
         self._points.append(self._to_original(event.x, event.y))
         self._redraw()
 
+    # -------------------------------------------------- 交互（手绘自定义）
+    def _poly_press(self, event):
+        if self._busy:
+            return
+        # 先判断是否点中手柄：点中则进入拖动手柄
+        if self._handles and not self._drawing:
+            for index, (hx, hy) in enumerate(self._handles):
+                dx, dy = self._to_display(hx, hy)
+                if math.hypot(event.x - dx, event.y - dy) <= 9:
+                    self._drag_handle = index
+                    return
+        # 否则开始新的一笔（已有轮廓会被替换，可用“重画”清空）
+        self._drag_handle = None
+        self._raw = [self._to_original(event.x, event.y)]
+        self._handles = []
+        self._contour = []
+        self._drawing = True
+        self._redraw()
+
+    def _poly_motion(self, event):
+        if self._busy:
+            return
+        if self._drag_handle is not None:
+            self._handles[self._drag_handle] = self._to_original(event.x, event.y)
+            # 拖动手柄后用较轻的平滑强度（0.5）重算，避免轮廓一下变太圆
+            self._refresh_contour(live=True, strength=0.5)
+            self._redraw()
+            return
+        if not self._drawing:
+            return
+        x, y = self._to_original(event.x, event.y)
+        if self._raw:
+            lx, ly = self._raw[-1]
+            min_step = max(1.0, 2.0 / max(self._scale, 1e-6))
+            if math.hypot(x - lx, y - ly) < min_step:
+                return
+        self._raw.append((x, y))
+        self._redraw()
+
+    def _poly_release(self, _event):
+        if self._busy:
+            return
+        if self._drag_handle is not None:
+            self._drag_handle = None
+            self._refresh_contour(live=False, strength=0.5)
+            self._redraw()
+            return
+        if not self._drawing:
+            return
+        self._drawing = False
+        if len(self._raw) < 3:
+            self._reset_poly()
+            self._redraw()
+            messagebox.showinfo("笔迹太短",
+                                "请按住鼠标左键，沿池底边缘完整描一圈再松手。", parent=self)
+            return
+        if self._contour_area(self._raw) < self._min_poly_area():
+            self._reset_poly()
+            self._redraw()
+            messagebox.showinfo("轮廓太小", "描出的区域太小，请把池底轮廓描大一些。",
+                                parent=self)
+            return
+        try:
+            contour = core.smooth_contour([list(p) for p in self._raw],
+                                          float(self.var_strength.get()))
+            self._handles = self._resample_handles(contour, POLY_HANDLES)
+        except Exception:
+            self._handles = self._resample_handles(self._raw, POLY_HANDLES)
+        self._refresh_contour(live=False)
+        self._redraw()
+
+    def _reset_poly(self):
+        self._raw = []
+        self._handles = []
+        self._contour = []
+        self._drag_handle = None
+        self._drawing = False
+
+    def _min_poly_area(self) -> float:
+        return max(64.0, 1e-4 * float(self._frame_w * self._frame_h))
+
+    @staticmethod
+    def _contour_area(points) -> float:
+        pts = [(float(p[0]), float(p[1])) for p in points]
+        if len(pts) < 3:
+            return 0.0
+        area = 0.0
+        for index in range(len(pts)):
+            x1, y1 = pts[index]
+            x2, y2 = pts[(index + 1) % len(pts)]
+            area += x1 * y2 - x2 * y1
+        return abs(area) / 2.0
+
+    @staticmethod
+    def _resample_handles(points, count: int = POLY_HANDLES):
+        """沿闭合轮廓按弧长等距取最多 count 个控制点（原图坐标）。"""
+        pts = [(float(p[0]), float(p[1])) for p in points]
+        n = len(pts)
+        if n <= count:
+            return pts
+        segs = []
+        total = 0.0
+        for index in range(n):
+            ax, ay = pts[index]
+            bx, by = pts[(index + 1) % n]
+            dist = math.hypot(bx - ax, by - ay)
+            segs.append(dist)
+            total += dist
+        if total <= 1e-6:
+            return pts[:count]
+        cum = [0.0]
+        for dist in segs:
+            cum.append(cum[-1] + dist)
+        handles = []
+        seg_index = 0
+        for k in range(count):
+            target = total * k / count
+            while seg_index < n - 1 and cum[seg_index + 1] < target:
+                seg_index += 1
+            seg_len = segs[seg_index]
+            ratio = (target - cum[seg_index]) / seg_len if seg_len > 1e-9 else 0.0
+            ax, ay = pts[seg_index]
+            bx, by = pts[(seg_index + 1) % n]
+            handles.append((ax + (bx - ax) * ratio, ay + (by - ay) * ratio))
+        return handles
+
+    def _refresh_contour(self, live: bool = False, strength=None):
+        """按当前平滑强度（可选边缘吸附）重新计算绿色轮廓。
+
+        strength 为 None 时用平滑强度滑块的值；拖动手柄时传 0.5 做轻平滑。
+        """
+        if self._shape != SHAPE_POLY or not self._handles:
+            self._contour = []
+            return
+        if strength is None:
+            try:
+                strength = float(self.var_strength.get())
+            except (tk.TclError, ValueError):
+                strength = 1.0
+        handles = [[float(p[0]), float(p[1])] for p in self._handles]
+        try:
+            contour = core.smooth_contour(handles, strength)
+        except Exception:
+            contour = handles
+        if self.var_snap.get() and not live:
+            try:
+                contour = core.snap_contour(self._frame, contour)
+            except Exception:
+                pass
+        self._contour = [(float(p[0]), float(p[1])) for p in contour]
+
+    def _on_strength_changed(self, _value=None):
+        try:
+            self.var_strength_text.set("%.2f" % float(self.var_strength.get()))
+        except (tk.TclError, ValueError):
+            pass
+        if self._shape == SHAPE_POLY and self._handles:
+            self._refresh_contour(live=True)
+            self._redraw()
+
+    def _on_strength_release(self, _event=None):
+        if self._shape == SHAPE_POLY and self._handles:
+            self._refresh_contour(live=False)
+            self._redraw()
+
+    def _on_snap_toggle(self):
+        if self._shape == SHAPE_POLY and self._handles:
+            self._refresh_contour(live=False)
+            self._redraw()
+
     def _clear(self):
         if self._busy:
             return
-        self._points = []
+        if self._shape == SHAPE_POLY:
+            self._reset_poly()
+        else:
+            self._points = []
         self._redraw()
 
     def _set_busy(self, busy: bool):
@@ -314,6 +533,11 @@ class CalibrationDialog(tk.Toplevel):
         state = "disabled" if busy else "normal"
         for btn in (self.btn_clear, self.btn_auto, self.btn_ok, self.btn_cancel):
             btn.configure(state=state)
+        try:
+            self.scale_strength.configure(state=state)
+            self.chk_snap.configure(state=state)
+        except (tk.TclError, AttributeError):
+            pass
         if busy:
             self.update_idletasks()
 
@@ -334,6 +558,11 @@ class CalibrationDialog(tk.Toplevel):
             messagebox.showwarning("自动识别失败", "自动识别失败，请手动点选。", parent=self)
             return
         self._set_busy(False)
+        if self._shape == SHAPE_POLY:
+            self._handles = self._resample_handles(points, POLY_HANDLES)
+            self._refresh_contour(live=False)
+            self._redraw()
+            return
         self._points = points[: self._required]
         self._redraw()
         if len(self._points) < self._required:
@@ -344,6 +573,24 @@ class CalibrationDialog(tk.Toplevel):
 
     def _confirm(self):
         if self._busy:
+            return
+        if self._shape == SHAPE_POLY:
+            self._refresh_contour(live=False)
+            contour = self._contour
+            if len(contour) < 3:
+                messagebox.showwarning(
+                    "标定未完成", "请先在画面上按住左键拖动，描出池底轮廓。", parent=self)
+                return
+            if self._contour_area(contour) < self._min_poly_area():
+                messagebox.showwarning("轮廓太小", "描出的区域太小，请重新描。", parent=self)
+                return
+            points = [(int(round(p[0])), int(round(p[1]))) for p in contour]
+            try:
+                self.result = core.Calibration(shape=self._shape, points=points)
+            except Exception as exc:
+                messagebox.showerror("标定失败", str(exc), parent=self)
+                return
+            self.destroy()
             return
         if len(self._points) != self._required:
             messagebox.showwarning(
@@ -370,11 +617,38 @@ class CalibrationDialog(tk.Toplevel):
     # -------------------------------------------------- 绘制
     def _redraw(self):
         self.canvas.delete("mk")
-        if self._shape == SHAPE_RECT:
+        if self._shape == SHAPE_POLY:
+            self._draw_poly()
+        elif self._shape == SHAPE_RECT:
             self._draw_rect_marks()
         else:
             self._draw_ellipse_marks()
         self._update_hint()
+
+    def _draw_poly(self):
+        # 原始笔迹：细浅色折线
+        if self._raw:
+            coords = []
+            for x, y in self._raw:
+                dx, dy = self._to_display(x, y)
+                coords.extend([dx, dy])
+            if len(coords) >= 4:
+                self.canvas.create_line(coords, fill="#ffab91", width=1, tags="mk")
+        # 平滑后的闭合轮廓：绿色粗线
+        if len(self._contour) >= 3:
+            coords = []
+            for x, y in self._contour:
+                dx, dy = self._to_display(x, y)
+                coords.extend([dx, dy])
+            self.canvas.create_polygon(coords, outline="#69f0ae", fill="", width=3,
+                                       tags="mk")
+        # ≤12 个可拖动手柄
+        if self._handles and not self._drawing:
+            for hx, hy in self._handles:
+                dx, dy = self._to_display(hx, hy)
+                r = 5
+                self.canvas.create_oval(dx - r, dy - r, dx + r, dy + r, fill="#ffd740",
+                                        outline="#ffffff", width=1, tags="mk")
 
     def _draw_rect_marks(self):
         disp = [self._to_display(p[0], p[1]) for p in self._points]
@@ -436,6 +710,16 @@ class CalibrationDialog(tk.Toplevel):
                                     font=("TkDefaultFont", 10, "bold"), tags="mk")
 
     def _update_hint(self):
+        if self._shape == SHAPE_POLY:
+            if self._drawing:
+                text = "正在描边…已采集 %d 个点（松开左键自动闭合）" % len(self._raw)
+            elif self._handles:
+                text = ("已闭合：绿色为平滑轮廓，可拖动黄色手柄微调，满意后点“确定”"
+                        "（共 %d 个控制点）" % len(self._handles))
+            else:
+                text = "手绘模式：按住鼠标左键，沿池底边缘描一圈，松手自动闭合"
+            self.var_hint.set(text)
+            return
         n = len(self._points)
         if self._shape == SHAPE_RECT:
             if n == 0:
@@ -592,6 +876,7 @@ class PoolCoverageApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.reports_root = default_reports_root()
+        self.templates_root = os.path.join(app_dir(), TEMPLATES_DIR_NAME)
         self.video_path = ""
         self._calib = None
         self._result = None
@@ -603,10 +888,12 @@ class PoolCoverageApp:
         self._worker = None
         self._history_records = []
         self._history_by_iid = {}
+        self._templates = []
 
         self._setup_fonts()
         self._build_ui()
         self._refresh_history()
+        self._refresh_templates()
 
     # -------------------------------------------------- 外观
     def _setup_fonts(self):
@@ -660,7 +947,7 @@ class PoolCoverageApp:
         pool_box.columnconfigure(3, weight=1)
         ttk.Label(pool_box, text="池型：").grid(row=0, column=0, sticky="w")
         shape_frame = ttk.Frame(pool_box)
-        shape_frame.grid(row=0, column=1, columnspan=2, sticky="w", padx=(0, 12))
+        shape_frame.grid(row=0, column=1, sticky="w", padx=(0, 12))
         self.var_shape = tk.StringVar(value=SHAPE_RECT)
         self.rb_rect = ttk.Radiobutton(shape_frame, text="矩形", value=SHAPE_RECT,
                                        variable=self.var_shape,
@@ -669,8 +956,12 @@ class PoolCoverageApp:
                                           value=SHAPE_ELLIPSE,
                                           variable=self.var_shape,
                                           command=self._on_shape_changed)
+        self.rb_poly = ttk.Radiobutton(shape_frame, text="手绘自定义", value=SHAPE_POLY,
+                                       variable=self.var_shape,
+                                       command=self._on_shape_changed)
         self.rb_rect.grid(row=0, column=0, padx=(0, 14))
-        self.rb_ellipse.grid(row=0, column=1)
+        self.rb_ellipse.grid(row=0, column=1, padx=(0, 14))
+        self.rb_poly.grid(row=0, column=2)
         self.btn_calibrate = ttk.Button(pool_box, text="打开画面标定…", width=16,
                                         command=self._open_calibration)
         self.btn_calibrate.grid(row=0, column=4, sticky="e")
@@ -678,8 +969,32 @@ class PoolCoverageApp:
         self.lbl_calib = ttk.Label(pool_box, textvariable=self.var_calib_status,
                                    foreground="#b26a00")
         self.lbl_calib.grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
-        ttk.Label(pool_box, text="矩形池：依次点 4 个池角；圆形池：依次点 池中心 → 长轴端点 → 短轴端点。",
+        ttk.Label(pool_box,
+                  text="矩形：点 4 个池角；圆形：池中心 → 长轴端点 → 短轴端点；"
+                       "手绘：按住拖动描一圈，松手自动闭合。",
                   style="Hint.TLabel").grid(row=2, column=0, columnspan=5, sticky="w")
+
+        # ---- 2b. 机位模板（保存/复用标定，换视频不用重描）
+        tpl_frame = ttk.Frame(pool_box)
+        tpl_frame.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(6, 0))
+        tpl_frame.columnconfigure(1, weight=1)
+        ttk.Label(tpl_frame, text="机位模板：").grid(row=0, column=0, sticky="w")
+        self.var_template = tk.StringVar(value="")
+        self.combo_template = ttk.Combobox(tpl_frame, textvariable=self.var_template,
+                                           state="readonly", width=26)
+        self.combo_template.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self.btn_tpl_apply = ttk.Button(tpl_frame, text="套用", width=8,
+                                        command=self._apply_template)
+        self.btn_tpl_apply.grid(row=0, column=2, padx=(0, 6))
+        self.btn_tpl_save = ttk.Button(tpl_frame, text="保存为模板", width=12,
+                                       command=self._save_template)
+        self.btn_tpl_save.grid(row=0, column=3, padx=(0, 6))
+        self.btn_tpl_delete = ttk.Button(tpl_frame, text="删除", width=8,
+                                         command=self._delete_template)
+        self.btn_tpl_delete.grid(row=0, column=4)
+        self.var_template_hint = tk.StringVar(value="机位模板：暂无")
+        ttk.Label(tpl_frame, textvariable=self.var_template_hint,
+                  style="Hint.TLabel").grid(row=0, column=5, sticky="w", padx=(12, 0))
         row += 1
 
         # ---- 3. 参数
@@ -864,12 +1179,139 @@ class PoolCoverageApp:
 
     # -------------------------------------------------- 池型
     def _on_shape_changed(self):
-        if self._calib is not None:
+        shape = self._current_shape()
+        if self._calib is not None and getattr(self._calib, "shape", None) != shape:
             self._clear_calibration("未标定（池型已更改，请重新标定）")
 
     def _current_shape(self) -> str:
         value = self.var_shape.get()
-        return value if value in (SHAPE_RECT, SHAPE_ELLIPSE) else SHAPE_RECT
+        if value in (SHAPE_RECT, SHAPE_ELLIPSE, SHAPE_POLY):
+            return value
+        return SHAPE_RECT
+
+    # -------------------------------------------------- 机位模板
+    def _template_name(self, record) -> str:
+        name = str(record.get("name") or "")
+        if not name:
+            name = os.path.splitext(os.path.basename(str(record.get("path") or "")))[0]
+        return name
+
+    def _refresh_templates(self):
+        records = []
+        if core is not None and os.path.isdir(self.templates_root):
+            try:
+                records = list(core.list_templates(self.templates_root))
+            except Exception:
+                records = []
+        self._templates = [r for r in records if isinstance(r, dict) and r.get("path")]
+        names = []
+        for record in self._templates:
+            name = self._template_name(record)
+            if name and name not in names:
+                names.append(name)
+        try:
+            self.combo_template.configure(values=names)
+        except tk.TclError:
+            return
+        if self.var_template.get() not in names:
+            self.var_template.set(names[0] if names else "")
+        if names:
+            self.var_template_hint.set("共 %d 个，选一个后点“套用”" % len(names))
+        else:
+            self.var_template_hint.set("暂无模板：先完成标定，再点“保存为模板”")
+
+    def _find_template(self, name: str):
+        for record in self._templates:
+            if self._template_name(record) == name:
+                return record
+        return None
+
+    def _apply_template(self):
+        if core is None:
+            messagebox.showerror("无法套用", "缺少分析核心 core.py，程序不完整。")
+            return
+        name = self.var_template.get()
+        if not name:
+            messagebox.showinfo("暂无模板",
+                                "还没有机位模板。请先完成池面标定，再点“保存为模板”。")
+            return
+        record = self._find_template(name)
+        if record is None:
+            self._refresh_templates()
+            messagebox.showinfo("模板不存在", "找不到模板“%s”。" % name)
+            return
+        try:
+            calib = core.load_template(str(record.get("path")))
+        except Exception as exc:
+            messagebox.showerror("套用模板失败", "无法读取模板文件：\n%s" % exc)
+            return
+        shape = getattr(calib, "shape", None)
+        points = getattr(calib, "points", []) or []
+        if shape not in (SHAPE_RECT, SHAPE_ELLIPSE, SHAPE_POLY) or not points:
+            messagebox.showerror("模板无效", "模板内容不完整，请删掉后重新保存。")
+            return
+        self.var_shape.set(shape)
+        self._set_calibrated(calib)
+        self._set_status("已套用机位模板：%s（%s）"
+                         % (name, SHAPE_LABELS.get(shape, shape)))
+
+    def _save_template(self):
+        if self._calib is None:
+            messagebox.showinfo("请先标定", "请先完成池面标定，再保存为机位模板。")
+            return
+        if core is None:
+            messagebox.showerror("无法保存", "缺少分析核心 core.py，程序不完整。")
+            return
+        default_name = ""
+        if self.video_path:
+            default_name = os.path.splitext(os.path.basename(self.video_path))[0]
+        default_name = default_name or time.strftime("机位模板_%Y%m%d-%H%M%S")
+        name = simpledialog.askstring(
+            "保存机位模板",
+            "给这个机位起个名字（以后换视频可直接套用）：",
+            initialvalue=default_name, parent=self.root)
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            messagebox.showwarning("名称为空", "请输入模板名称。")
+            return
+        if self._find_template(name) is not None:
+            if not messagebox.askyesno("模板已存在",
+                                       "已存在同名模板“%s”，要覆盖吗？" % name):
+                return
+        try:
+            os.makedirs(self.templates_root, exist_ok=True)
+            path = core.save_template(self.templates_root, name, self._calib,
+                                      source_video=self.video_path or "")
+        except Exception as exc:
+            messagebox.showerror("保存模板失败", "无法保存模板：\n%s" % exc)
+            return
+        self._refresh_templates()
+        self.var_template.set(name)
+        self._set_status("已保存机位模板：%s" % name)
+        if path:
+            self.var_template_hint.set("已保存：%s" % os.path.basename(str(path)))
+
+    def _delete_template(self):
+        name = self.var_template.get()
+        if not name:
+            messagebox.showinfo("暂无模板", "当前没有可删除的机位模板。")
+            return
+        record = self._find_template(name)
+        if record is None:
+            self._refresh_templates()
+            return
+        if not messagebox.askyesno("删除模板",
+                                   "确定删除机位模板“%s”吗？此操作不可恢复。" % name):
+            return
+        try:
+            os.remove(str(record.get("path")))
+        except OSError as exc:
+            messagebox.showerror("删除模板失败", "无法删除模板文件：\n%s" % exc)
+            return
+        self._refresh_templates()
+        self._set_status("已删除机位模板：%s" % name)
 
     # -------------------------------------------------- 标定
     def _open_calibration(self):
@@ -919,6 +1361,10 @@ class PoolCoverageApp:
         if getattr(self._calib, "shape", None) != self._current_shape():
             self._clear_calibration("未标定（池型已更改，请重新标定）")
             messagebox.showinfo("请重新标定", "池型已更改，请重新完成池面标定。")
+            return
+        if getattr(self._calib, "shape", None) == SHAPE_POLY and \
+                len(getattr(self._calib, "points", []) or []) < 3:
+            messagebox.showwarning("标定无效", "手绘轮廓至少需要 3 个点，请重新标定。")
             return
         target = TARGET_MAP.get(self.var_target.get(), "auto")
         try:
@@ -1102,9 +1548,12 @@ class PoolCoverageApp:
     def _set_analyzing(self, analyzing: bool):
         self._analyzing = analyzing
         state = "disabled" if analyzing else "normal"
-        for widget in (self.btn_browse, self.rb_rect, self.rb_ellipse,
+        for widget in (self.btn_browse, self.rb_rect, self.rb_ellipse, self.rb_poly,
                        self.btn_calibrate, self.btn_start):
             widget.configure(state=state)
+        for widget in (self.btn_tpl_apply, self.btn_tpl_save, self.btn_tpl_delete):
+            widget.configure(state=state)
+        self.combo_template.configure(state="disabled" if analyzing else "readonly")
         self.combo_target.configure(state="disabled" if analyzing else "readonly")
         self.scale_sens.configure(state="disabled" if analyzing else "normal")
         self.btn_cancel.configure(state="normal" if analyzing else "disabled")

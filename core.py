@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import math
+import re
 import time
 import subprocess
 from dataclasses import dataclass, field, asdict
@@ -16,9 +17,10 @@ from dataclasses import dataclass, field, asdict
 import numpy as np
 import cv2
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SHAPE_RECT = "rect"
 SHAPE_ELLIPSE = "ellipse"
+SHAPE_POLY = "poly"
 
 SWATH_FACTOR = 0.85      # 有效清洗宽度 = 检测框等效直径 × 该系数
 GAP_FRAMES_MAX = 12      # 相邻检测点允许连线的最大间隔帧
@@ -171,6 +173,122 @@ def _ellipse_params(calib):
     return (float(c[0]), float(c[1])), (2.0 * a, 2.0 * b), angle
 
 
+def _poly_points(points):
+    """把任意点列表整理成 (N,2) float32 闭合轮廓点（去掉重复点）"""
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if len(pts) < 3:
+        raise ValueError("轮廓至少需要 3 个点")
+    keep = [pts[0]]
+    for p in pts[1:]:
+        if np.linalg.norm(p - keep[-1]) > 1e-6:
+            keep.append(p)
+    pts = np.array(keep, np.float32)
+    if len(pts) < 3:
+        raise ValueError("轮廓点过于集中")
+    return pts
+
+
+def _resample_closed(points, step):
+    """把闭合轮廓按弧长等距重采样"""
+    pts = _poly_points(points)
+    closed = np.vstack([pts, pts[0]])
+    seg = np.linalg.norm(np.diff(closed, axis=0), axis=1)
+    perim = float(seg.sum())
+    if perim <= 1e-3:
+        raise ValueError("轮廓周长过小")
+    step = max(1e-3, float(step))
+    n = int(max(8, min(800, round(perim / step))))
+    targets = np.linspace(0.0, perim, n, endpoint=False)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    out = []
+    j = 0
+    for t in targets:
+        while j < len(seg) and cum[j + 1] < t:
+            j += 1
+        j = min(j, len(seg) - 1)
+        r = (t - cum[j]) / max(1e-9, seg[j])
+        out.append(closed[j] + (closed[j + 1] - closed[j]) * r)
+    return np.array(out, np.float32)
+
+
+def _chaikin_closed(points, iters=1):
+    pts = np.asarray(points, np.float32)
+    for _ in range(max(0, int(iters))):
+        out = []
+        n = len(pts)
+        for i in range(n):
+            p, q = pts[i], pts[(i + 1) % n]
+            out.append(0.75 * p + 0.25 * q)
+            out.append(0.25 * p + 0.75 * q)
+        pts = np.array(out, np.float32)
+    return pts
+
+
+def smooth_contour(points, strength=1.0):
+    """把用户手绘的折线轮廓变平滑（返回稠密闭合轮廓点列表）
+
+    strength: 0=只重采样不圆滑, 1=标准, 2=更强；越大越圆润但会略微收缩。
+    """
+    try:
+        strength = max(0.0, min(3.0, float(strength)))
+    except (TypeError, ValueError):
+        strength = 1.0
+    pts = _poly_points(points)
+    if strength <= 0.05:
+        return _resample_closed(pts, 3.0).tolist()
+    # 先粗采样 -> Chaikin 平滑 -> 再细采样
+    coarse = _resample_closed(pts, 12.0)
+    iters = max(1, int(round(strength * 2)))
+    sm = _chaikin_closed(coarse, iters)
+    sm = _resample_closed(sm, 4.0)
+    return [[float(x), float(y)] for x, y in sm]
+
+
+def snap_contour(frame, points, band_px=None):
+    """可选：把轮廓点沿法线方向吸附到画面里梯度最强的位置（池壁/池底交界）。
+
+    默认只在很小的范围内搜索并强阻尼，不会大幅改变轮廓；失败时返回原轮廓。
+    """
+    try:
+        pts = _resample_closed(points, 4.0)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+        gray = cv2.GaussianBlur(gray, (5, 5), 0).astype(np.float32)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        grad = np.hypot(gx, gy)
+        h, w = grad.shape
+        if band_px is None:
+            band_px = max(4.0, 0.012 * min(h, w))
+        band_px = float(max(2.0, min(band_px, 0.05 * min(h, w))))
+        offsets = np.arange(-band_px, band_px + 0.5, 1.0)
+        cur = pts.copy()
+        for _ in range(3):
+            nxt = []
+            n = len(cur)
+            for i in range(n):
+                a, b = cur[i - 1], cur[(i + 1) % n]
+                t = b - a
+                nt = np.linalg.norm(t)
+                if nt < 1e-6:
+                    nxt.append(cur[i]); continue
+                t = t / nt
+                nrm = np.array([-t[1], t[0]], np.float32)
+                q = cur[i][None, :] + nrm[None, :] * offsets[:, None]
+                xs = np.clip(np.round(q[:, 0]).astype(int), 0, w - 1)
+                ys = np.clip(np.round(q[:, 1]).astype(int), 0, h - 1)
+                vals = grad[ys, xs]
+                # 轻微偏向近处的惩罚，避免乱跳
+                vals = vals * (1.0 - 0.15 * np.abs(offsets) / band_px)
+                k = int(np.argmax(vals))
+                target = cur[i] + nrm * offsets[k]
+                nxt.append(cur[i] + (target - cur[i]) * 0.5)
+            cur = np.array(nxt, np.float32)
+            cur = _resample_closed(_chaikin_closed(cur, 1), 4.0)
+        return [[float(x), float(y)] for x, y in cur]
+    except Exception:
+        return [[float(x), float(y)] for x, y in np.asarray(points, np.float32).reshape(-1, 2)]
+
+
 def build_pool_mask(shape, size, calib):
     """返回 uint8 池面掩膜（池内 255）"""
     w, h = int(size[0]), int(size[1])
@@ -183,6 +301,11 @@ def build_pool_mask(shape, size, calib):
         cv2.ellipse(mask, (int(round(center[0])), int(round(center[1]))),
                     (max(3, int(round(axes[0] / 2))), max(3, int(round(axes[1] / 2)))),
                     angle, 0, 360, 255, -1)
+    elif calib.shape == SHAPE_POLY:
+        pts = _poly_points(calib.points)
+        if len(pts) < 3:
+            raise ValueError("手绘轮廓至少需要 3 个点")
+        cv2.fillPoly(mask, [pts.astype(np.int32)], 255)
     else:
         raise ValueError("未知池型：%s" % calib.shape)
     return mask
@@ -223,6 +346,9 @@ def auto_calibrate(path, shape=SHAPE_RECT):
     hull, area, total = _water_mask(frame)
     if hull is None or len(hull) < 3:
         raise RuntimeError("自动识别失败，请手动点选池边")
+    if shape == SHAPE_POLY:
+        pts = smooth_contour(hull.reshape(-1, 2).tolist(), 1.0)
+        return Calibration(SHAPE_POLY, pts)
     if shape == SHAPE_ELLIPSE:
         ell = cv2.fitEllipse(hull)
         (cx, cy), (MA, ma), ang = ell
@@ -284,6 +410,25 @@ def _detect_candidates(gray, bg_gray, roi, mode, thr, pool_area, kern):
     return out
 
 
+def _estimate_robot_area(cap, bg_gray, roi, mode, thr, pool_area, kern, n_frames, samples=25):
+    """抽样若干帧，用每帧最大候选的面积中位数估计机器人大小（机器人通常是最大的运动目标）"""
+    areas = []
+    idxs = np.linspace(0, max(0, n_frames - 1), max(6, int(samples))).astype(int)
+    for i in idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        cands = _detect_candidates(gray, bg_gray, roi, mode, thr, pool_area, kern)
+        if cands:
+            areas.append(cands[0]["area"])
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    if not areas:
+        return None
+    return float(np.median(areas))
+
+
 def _pick_candidate(cands, prev, gate, size_ref, pred=None):
     """从候选里挑机器人：先按尺寸一致性过滤，再按预测位置门限匹配。
     有上一帧但找不到合理候选时返回 None（视为该帧漏检），避免跳到反光/漂浮物上。"""
@@ -291,7 +436,7 @@ def _pick_candidate(cands, prev, gate, size_ref, pred=None):
         return None
     if size_ref and len(size_ref) >= 5:
         med = float(np.median(size_ref))
-        cands = [c for c in cands if 0.3 * med <= c["area"] <= 3.0 * med]
+        cands = [c for c in cands if 0.2 * med <= c["area"] <= 3.5 * med]
         if not cands:
             return None
     if prev is not None:
@@ -374,6 +519,9 @@ def _save_heatmap(path, pass_cnt, mask_small, calib, pts, crop, ds, out_w=1000):
 
     if calib.shape == SHAPE_RECT:
         cv2.polylines(heat, [np.array([mp(*p) for p in _order_rect_points(calib.points)], np.int32)],
+                      True, (255, 255, 255), 2)
+    elif calib.shape == SHAPE_POLY:
+        cv2.polylines(heat, [np.array([mp(*p) for p in calib.points], np.int32)],
                       True, (255, 255, 255), 2)
     else:
         center, axes, angle = _ellipse_params(calib)
@@ -472,8 +620,13 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
     if pool_area < 0.02 * vw * vh:
         raise RuntimeError("标定的池面区域过小（不到画面 2%），请重新标定")
 
-    # 检测 ROI：池面外扩一点，容忍机器人贴边
-    pad = max(8, int(0.01 * math.hypot(vw, vh)))
+    # 检测 ROI：池面外扩一圈（按池子尺寸），容忍机器人贴边/标定略小于实际活动范围
+    try:
+        _ys, _xs = np.where(pool_mask > 0)
+        _bw = int(_xs.max() - _xs.min() + 1); _bh = int(_ys.max() - _ys.min() + 1)
+    except Exception:
+        _bw, _bh = vw, vh
+    pad = max(12, int(0.01 * math.hypot(vw, vh)), int(0.10 * min(_bw, _bh)))
     roi = cv2.dilate(pool_mask, np.ones((pad * 2 + 1, pad * 2 + 1), np.uint8))
     roi = cv2.bitwise_and(roi, roi)
 
@@ -508,12 +661,14 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
     warnings = []
     gate = 0.15 * math.hypot(vw, vh)
 
-    def run_track_pass(mode, p0=0.05, p1=0.60):
+    def run_track_pass(mode, p0=0.05, p1=0.60, size_hint=None):
         cap2 = cv2.VideoCapture(video_path)
         if not cap2.isOpened():
             raise RuntimeError("无法打开视频文件")
         dets_local = [None] * n_frames
-        prev, prev2, size_ref, misses = None, None, [], 0
+        prev, prev2 = None, None
+        size_ref = [size_hint] * 8 if size_hint else []
+        misses = 0
         cnt = 0
         for k in range(n_frames):
             ok, frame = cap2.read()
@@ -548,17 +703,29 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
         cap2.release()
         return dets_local, cnt
 
+    _progress(progress, 0.04, "估计机器人尺寸…")
+    cap_hint = cv2.VideoCapture(video_path)
+    hint_mode = "dark" if target in ("auto", "dark") else "bright"
+    size_hint = _estimate_robot_area(cap_hint, bg_gray, roi, hint_mode, thr,
+                                     pool_area, kern, n_frames)
+    cap_hint.release()
+    print("机器人尺寸估计(px^2):", size_hint)
+
     if target == "auto":
-        _progress(progress, 0.05, "检测机器人（暗色目标）…")
-        dets, detected = run_track_pass("dark", 0.05, 0.55)
+        _progress(progress, 0.06, "检测机器人（暗色目标）…")
+        dets, detected = run_track_pass("dark", 0.06, 0.55, size_hint)
         if detected < 0.25 * n_frames:
-            _progress(progress, 0.05, "暗色目标较少，尝试亮色目标…")
-            dets2, detected2 = run_track_pass("bright", 0.10, 0.60)
+            _progress(progress, 0.06, "暗色目标较少，尝试亮色目标…")
+            cap_hint2 = cv2.VideoCapture(video_path)
+            hint2 = _estimate_robot_area(cap_hint2, bg_gray, roi, "bright", thr,
+                                         pool_area, kern, n_frames)
+            cap_hint2.release()
+            dets2, detected2 = run_track_pass("bright", 0.10, 0.60, hint2)
             if detected2 > detected:
                 dets, detected = dets2, detected2
                 warnings.append("已自动切换为亮色目标检测。")
     else:
-        dets, detected = run_track_pass(target, 0.05, 0.60)
+        dets, detected = run_track_pass(target, 0.06, 0.60, size_hint)
     _check_cancel(cancel)
     if detected < 5:
         raise RuntimeError("未检测到机器人。可调高灵敏度、切换目标类型，或检查池面标定是否准确。")
@@ -664,8 +831,11 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
         raise RuntimeError("无法创建输出视频（缺少视频编码器）")
     if ffmpeg is None:
         warnings.append("未找到 ffmpeg，轨迹视频已用 MJPG/AVI 编码，兼容性略低。")
+    poly_pts = None
     if calib.shape == SHAPE_RECT:
         rect_pts = np.array(_order_rect_points(calib.points), np.int32)
+    elif calib.shape == SHAPE_POLY:
+        poly_pts = np.array(calib.points, np.float32).reshape(-1, 2)
     else:
         center, axes, angle = _ellipse_params(calib)
     cap = cv2.VideoCapture(video_path)
@@ -679,6 +849,8 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
         sx = out_w / float(vw)
         if calib.shape == SHAPE_RECT:
             cv2.polylines(vis, [(rect_pts * sx).astype(np.int32)], True, (0, 255, 255), 2)
+        elif calib.shape == SHAPE_POLY:
+            cv2.polylines(vis, [(poly_pts * sx).astype(np.int32)], True, (0, 255, 255), 2)
         else:
             cv2.ellipse(vis, (int(center[0] * sx), int(center[1] * sx)),
                         (max(2, int(axes[0] / 2 * sx)), max(2, int(axes[1] / 2 * sx))),
@@ -743,6 +915,76 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
         json.dump(payload, f, ensure_ascii=False, indent=1)
     _progress(progress, 1.0, "完成")
     return result
+
+
+# ---------------------------------------------------------------- 机位模板
+def _safe_template_name(name):
+    name = re.sub(r'[\\/:*?"<>|\s]+', "_", str(name or "")).strip("._")
+    return name[:60] or "template"
+
+
+def save_template(templates_dir, name, calib, source_video=""):
+    """把当前标定保存为机位模板，返回 json 路径"""
+    if not isinstance(calib, Calibration):
+        raise RuntimeError("没有可保存的标定")
+    os.makedirs(templates_dir, exist_ok=True)
+    fname = _safe_template_name(name) + ".json"
+    path = os.path.join(templates_dir, fname)
+    payload = {
+        "version": 1,
+        "name": str(name),
+        "shape": calib.shape,
+        "points": [[float(x), float(y)] for x, y in calib.points],
+        "source_video": str(source_video or ""),
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=1)
+    return path
+
+
+def list_templates(templates_dir):
+    """列出模板目录里的机位模板，按创建时间倒序"""
+    out = []
+    if not templates_dir or not os.path.isdir(templates_dir):
+        return out
+    for fn in os.listdir(templates_dir):
+        if not fn.lower().endswith(".json"):
+            continue
+        path = os.path.join(templates_dir, fn)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            shape = d.get("shape")
+            pts = d.get("points") or []
+            if shape not in (SHAPE_RECT, SHAPE_ELLIPSE, SHAPE_POLY) or len(pts) < 3:
+                continue
+            out.append({
+                "name": d.get("name") or os.path.splitext(fn)[0],
+                "path": os.path.abspath(path),
+                "shape": shape,
+                "points": [[float(p[0]), float(p[1])] for p in pts],
+                "source_video": d.get("source_video", ""),
+                "created": d.get("created", ""),
+                "mtime": os.path.getmtime(path),
+            })
+        except Exception:
+            continue
+    out.sort(key=lambda x: -x["mtime"])
+    return out
+
+
+def load_template(path):
+    """读取机位模板，返回 Calibration"""
+    with open(path, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    shape = d.get("shape")
+    pts = d.get("points") or []
+    if shape not in (SHAPE_RECT, SHAPE_ELLIPSE, SHAPE_POLY):
+        raise RuntimeError("模板格式不正确：未知池型")
+    if len(pts) < (4 if shape == SHAPE_RECT else 3):
+        raise RuntimeError("模板格式不正确：标定点不足")
+    return Calibration(shape, [[float(p[0]), float(p[1])] for p in pts])
 
 
 # ---------------------------------------------------------------- 历史
