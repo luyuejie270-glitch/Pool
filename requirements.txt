@@ -1,0 +1,9 @@
+# 泳池机器人覆盖率分析 —— 依赖清单
+# GUI 使用 Python 自带的 tkinter（Windows 版 Python 已包含），无需额外安装。
+
+# 分析核心依赖（core.py 使用）
+opencv-python-headless>=4.9,<5
+numpy>=1.26,<3
+
+# 仅用于 GitHub Actions 打包 Windows 可执行文件；本机源码运行不需要
+pyinstaller>=6.0
