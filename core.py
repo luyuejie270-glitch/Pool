@@ -22,7 +22,7 @@ try:
 except Exception:  # pragma: no cover
     Image = ImageDraw = ImageFont = None
 
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 SHAPE_RECT = "rect"
 SHAPE_ELLIPSE = "ellipse"
 SHAPE_POLY = "poly"
@@ -669,12 +669,18 @@ def _gather_candidates(video_path, bg_gray, roi, modes, thr, pool_area, kern,
             cands.extend(_detect_candidates(gray, bg_gray, roi, mode, thr, pool_area, kern,
                                             amin_ratio=0.00006, amax_ratio=0.06))
         if pool_mask is not None and cands:
-            # 只保留中心落在标定池面内部的候选：池边/池外的固定物体直接排除
+            # 候选框至少有 25% 落在标定池面内才算（允许机器人贴边，排除池外的固定物体）
             h, w = pool_mask.shape[:2]
             keep = []
             for c in cands:
-                x = int(round(c["cx"])); y = int(round(c["cy"]))
-                if 0 <= x < w and 0 <= y < h and pool_mask[y, x] > 0:
+                x1 = max(0, int(round(c["cx"] - c["w"] / 2.0)))
+                x2 = min(w, int(round(c["cx"] + c["w"] / 2.0)) + 1)
+                y1 = max(0, int(round(c["cy"] - c["h"] / 2.0)))
+                y2 = min(h, int(round(c["cy"] + c["h"] / 2.0)) + 1)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                inside = int(np.count_nonzero(pool_mask[y1:y2, x1:x2]))
+                if inside >= 0.25 * float((x2 - x1) * (y2 - y1)):
                     keep.append(c)
             cands = keep
         out[k] = cands
@@ -1372,8 +1378,11 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
         else:
             modes = ["dark", "bright"]
         _progress(progress, 0.04, "检测目标（多轨迹跟踪）…")
+        _pm = pool_mask if det_scale == 1.0 else cv2.resize(
+            pool_mask, (bg_gray.shape[1], bg_gray.shape[0]), interpolation=cv2.INTER_NEAREST)
         cands_all = _gather_candidates(video_path, bg_gray, roi_det, modes, thr, pool_area_det,
-                                       kern_det, n_frames, stride, progress, cancel, 0.06, 0.58)
+                                       kern_det, n_frames, stride, progress, cancel, 0.06, 0.58,
+                                       pool_mask=_pm)
         dets, robot_track = _select_robot_track(cands_all, n_frames)
         detected = sum(1 for d in dets if d is not None)
         if detected < 5:
