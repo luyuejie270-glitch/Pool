@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""泳池机器人覆盖率分析 v0.5.4 —— Tkinter 桌面界面。
+"""泳池机器人覆盖率分析 v0.7.0 —— Tkinter 桌面界面。
 
 分析算法在 core.py（接口契约见 INTERFACE.md）。本模块遵守两条硬约束：
 
@@ -32,7 +32,7 @@ try:  # 缺少 core.py 时也允许 import 成功，main() 会给出中文提示
 except Exception:  # pragma: no cover - 仅在文件缺失/依赖损坏时触发
     core = None
 
-APP_TITLE = "泳池机器人覆盖率分析 v0.5.4"
+APP_TITLE = "泳池机器人覆盖率分析 v0.7.0"
 MIN_WINDOW_WIDTH = 900
 MIN_WINDOW_HEIGHT = 680
 
@@ -47,6 +47,7 @@ SHAPE_LABELS = {
 POLY_POINTS_MIN = 4                  # 手绘模式标定点数下限
 POLY_POINTS_MAX = 50                 # 手绘模式标定点数上限
 POLY_POINTS_DEFAULT = 8              # 手绘模式标定点数默认值
+SEED_MIN_BOX = 6                     # 手动框选机器人时允许的最小框（原视频像素）
 TEMPLATES_DIR_NAME = "PoolCoverageTemplates"
 UI_CONFIG_NAME = "ui_config.json"
 
@@ -917,6 +918,296 @@ class CalibrationDialog(tk.Toplevel):
         self.var_hint.set(text)
 
 
+# ============================================================ 框选机器人窗口
+class RobotSeedDialog(tk.Toplevel):
+    """手动框选机器人：在某一帧上拖一个矩形，返回 {"frame": 帧号, "box": [x,y,w,h]}。"""
+
+    MAX_CANVAS_W = 1000
+    MAX_CANVAS_H = 560
+
+    def __init__(self, master, video_path: str, info: dict, initial=None):
+        super().__init__(master)
+        self.withdraw()
+        self.result = None
+        self._video_path = video_path
+        self._src_w = int(info.get("width") or 0)
+        self._src_h = int(info.get("height") or 0)
+        self._frames = max(1, int(info.get("frames") or 0))
+        self._frame_index = 0
+        self._photo = None
+        self._scale = 1.0
+        self._disp_w = 0
+        self._disp_h = 0
+        self._box = None            # (x, y, w, h)，原视频坐标
+        self._drag_start = None     # 画布坐标
+        self._drag_now = None
+        self._frame_job = None
+
+        if core is None:
+            self.destroy()
+            raise RuntimeError("缺少分析核心 core.py")
+
+        width = self._src_w or 1280
+        height = self._src_h or 720
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        max_w = max(480, min(self.MAX_CANVAS_W, int(screen_w * 0.9)))
+        max_h = max(320, min(self.MAX_CANVAS_H, int(screen_h * 0.68)))
+        scale = min(max_w / float(width), max_h / float(height), 1.0)
+        self._disp_w = max(1, int(round(width * scale)))
+        self._disp_h = max(1, int(round(height * scale)))
+
+        self.title("框选机器人 —— %s" % os.path.basename(video_path))
+        self.transient(master)
+        self.resizable(False, False)
+
+        outer = ttk.Frame(self, padding=10)
+        outer.pack(fill="both", expand=True)
+
+        # 帧选择条
+        bar = ttk.Frame(outer)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Label(bar, text="帧：").pack(side="left")
+        self.var_frame = tk.DoubleVar(value=0.0)
+        self.scale_frame = ttk.Scale(bar, from_=0.0, to=float(max(0, self._frames - 1)),
+                                     length=280, variable=self.var_frame,
+                                     command=self._on_frame_scale)
+        self.scale_frame.pack(side="left", padx=(0, 8))
+        self.var_frame_text = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self.var_frame_text, width=16).pack(
+            side="left", padx=(0, 8))
+        self.btn_prev = ttk.Button(bar, text="上一帧", width=8,
+                                   command=lambda: self._step_frame(-1))
+        self.btn_prev.pack(side="left", padx=(0, 6))
+        self.btn_next = ttk.Button(bar, text="下一帧", width=8,
+                                   command=lambda: self._step_frame(1))
+        self.btn_next.pack(side="left")
+
+        self.canvas = tk.Canvas(outer, width=self._disp_w, height=self._disp_h,
+                                bg="#101010", highlightthickness=1,
+                                highlightbackground="#666666", cursor="crosshair")
+        self.canvas.pack()
+        self.canvas.bind("<Button-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+
+        self.var_hint = tk.StringVar(
+            value="拖动鼠标框住机器人本体（框住整个机器人，尽量选机器人清晰的一帧）")
+        ttk.Label(outer, textvariable=self.var_hint, foreground="#333333").pack(
+            fill="x", pady=(8, 6))
+
+        buttons = ttk.Frame(outer)
+        buttons.pack()
+        self.btn_ok = ttk.Button(buttons, text="确定", width=10, command=self._confirm)
+        self.btn_clear_box = ttk.Button(buttons, text="清除框", width=10,
+                                        command=self._clear_box)
+        self.btn_cancel = ttk.Button(buttons, text="取消", width=10, command=self.destroy)
+        for index, btn in enumerate((self.btn_ok, self.btn_clear_box, self.btn_cancel)):
+            btn.grid(row=0, column=index, padx=6)
+
+        initial_frame = 0
+        if isinstance(initial, dict):
+            try:
+                initial_frame = int(initial.get("frame", 0))
+            except (TypeError, ValueError):
+                initial_frame = 0
+        initial_frame = max(0, min(initial_frame, self._frames - 1))
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+        if not self._load_frame(initial_frame):
+            self.destroy()
+            raise RuntimeError("无法读取视频画面")
+        if isinstance(initial, dict):
+            box = initial.get("box")
+            if isinstance(box, (list, tuple)) and len(box) >= 4:
+                try:
+                    self._box = tuple(int(round(float(v))) for v in box[:4])
+                except (TypeError, ValueError):
+                    self._box = None
+        self._redraw_box()
+
+        self.update_idletasks()
+        try:
+            px, py = master.winfo_rootx(), master.winfo_rooty()
+            pw, ph = master.winfo_width(), master.winfo_height()
+            x = max(0, px + (pw - self.winfo_reqwidth()) // 2)
+            y = max(0, py + (ph - self.winfo_reqheight()) // 3)
+            self.geometry("+%d+%d" % (x, y))
+        except tk.TclError:
+            pass
+        self.deiconify()
+        self.grab_set()
+        self.focus_set()
+
+    # -------------------------------------------------- 坐标换算
+    def _to_original(self, x, y):
+        if self._scale <= 0:
+            return float(x), float(y)
+        return float(x) / self._scale, float(y) / self._scale
+
+    def _to_display(self, x, y):
+        return float(x) * self._scale, float(y) * self._scale
+
+    # -------------------------------------------------- 帧切换
+    def _update_frame_ui(self):
+        self.var_frame_text.set("第 %d / %d 帧" % (self._frame_index + 1, self._frames))
+        try:
+            if abs(float(self.var_frame.get()) - self._frame_index) > 0.01:
+                self.var_frame.set(float(self._frame_index))
+        except (tk.TclError, ValueError):
+            pass
+
+    def _cancel_frame_job(self):
+        if self._frame_job is not None:
+            try:
+                self.after_cancel(self._frame_job)
+            except tk.TclError:
+                pass
+            self._frame_job = None
+
+    def _on_frame_scale(self, _value=None):
+        self._cancel_frame_job()
+        try:
+            index = int(round(float(self.var_frame.get())))
+        except (tk.TclError, ValueError):
+            index = 0
+        index = max(0, min(index, self._frames - 1))
+        self.var_frame_text.set("第 %d / %d 帧" % (index + 1, self._frames))
+        if index == self._frame_index:
+            return
+        # 拖动滑杆时轻微防抖，避免每个像素都读一次视频
+        self._frame_job = self.after(80, lambda: self._load_frame_if_alive(index))
+
+    def _load_frame_if_alive(self, index: int):
+        self._frame_job = None
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self._load_frame(index)
+
+    def _step_frame(self, delta):
+        self._cancel_frame_job()
+        index = max(0, min(self._frame_index + int(delta), self._frames - 1))
+        self.var_frame.set(float(index))
+        self._cancel_frame_job()
+        self._load_frame(index)
+
+    def _read_frame(self, index):
+        try:
+            return core.probe_frame(self._video_path, int(index)), ""
+        except Exception as exc:
+            return None, str(exc)
+
+    def _load_frame(self, index: int) -> bool:
+        index = max(0, min(int(index), self._frames - 1))
+        frame, error = self._read_frame(index)
+        if frame is None:
+            self.var_hint.set("读取第 %d 帧失败：%s" % (index + 1, error))
+            return False
+        try:
+            photo, disp_w, disp_h, scale = frame_to_photo(frame, self._disp_w,
+                                                          self._disp_h)
+        except Exception as exc:
+            self.var_hint.set("显示画面失败：%s" % exc)
+            return False
+        if disp_w != self._disp_w or disp_h != self._disp_h:
+            self._disp_w, self._disp_h = disp_w, disp_h
+            self.canvas.configure(width=disp_w, height=disp_h)
+        self._photo = photo
+        self._scale = scale
+        self._frame_index = index
+        self._box = None
+        self._drag_start = None
+        self._drag_now = None
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+        self._update_frame_ui()
+        self._redraw_box()
+        return True
+
+    # -------------------------------------------------- 拖拽画框
+    def _on_press(self, event):
+        self._drag_start = (event.x, event.y)
+        self._drag_now = (event.x, event.y)
+        self._box = None
+        self._redraw_box()
+
+    def _on_drag(self, event):
+        if self._drag_start is None:
+            return
+        self._drag_now = (event.x, event.y)
+        self._redraw_box()
+
+    def _on_release(self, event):
+        if self._drag_start is None:
+            return
+        x0, y0 = self._drag_start
+        x1, y1 = event.x, event.y
+        self._drag_start = None
+        self._drag_now = None
+        # 夹到画布范围内，避免拖出画布产生越界坐标
+        x0 = max(0.0, min(float(x0), self._disp_w))
+        x1 = max(0.0, min(float(x1), self._disp_w))
+        y0 = max(0.0, min(float(y0), self._disp_h))
+        y1 = max(0.0, min(float(y1), self._disp_h))
+        ox0, oy0 = self._to_original(min(x0, x1), min(y0, y1))
+        ox1, oy1 = self._to_original(max(x0, x1), max(y0, y1))
+        bw = int(round(ox1 - ox0))
+        bh = int(round(oy1 - oy0))
+        if bw < SEED_MIN_BOX or bh < SEED_MIN_BOX:
+            self._box = None
+            self._redraw_box()
+            messagebox.showinfo(
+                "框太小",
+                "框选区域太小（至少 %d×%d 像素），请重新拖拽，框住整个机器人。"
+                % (SEED_MIN_BOX, SEED_MIN_BOX), parent=self)
+            return
+        self._box = (int(round(ox0)), int(round(oy0)), bw, bh)
+        self._redraw_box()
+
+    def _clear_box(self):
+        self._box = None
+        self._drag_start = None
+        self._drag_now = None
+        self._redraw_box()
+
+    def _redraw_box(self):
+        self.canvas.delete("box")
+        if self._box is not None:
+            bx, by, bw, bh = self._box
+            x0, y0 = self._to_display(bx, by)
+            x1, y1 = self._to_display(bx + bw, by + bh)
+            self.canvas.create_rectangle(x0, y0, x1, y1, outline="#ff5252", width=2,
+                                         tags="box")
+            self.canvas.create_text(x0 + 4, max(10.0, y0 - 10), anchor="w",
+                                    text="%d×%d" % (bw, bh), fill="#ff5252",
+                                    tags="box")
+        elif self._drag_start is not None and self._drag_now is not None:
+            x0, y0 = self._drag_start
+            x1, y1 = self._drag_now
+            self.canvas.create_rectangle(min(x0, x1), min(y0, y1),
+                                         max(x0, x1), max(y0, y1),
+                                         outline="#ffd740", width=2, dash=(5, 3),
+                                         tags="box")
+
+    def _confirm(self):
+        if self._box is None:
+            messagebox.showwarning("还未框选",
+                                   "请先在画面上拖动鼠标，框住机器人本体。", parent=self)
+            return
+        bx, by, bw, bh = self._box
+        if bw < SEED_MIN_BOX or bh < SEED_MIN_BOX:
+            messagebox.showwarning(
+                "框太小", "框选区域至少 %d×%d 像素，请重新框选。"
+                % (SEED_MIN_BOX, SEED_MIN_BOX), parent=self)
+            return
+        self.result = {"frame": int(self._frame_index),
+                       "box": [int(bx), int(by), int(bw), int(bh)]}
+        self.destroy()
+
+
 # ============================================================ 历史对比窗口
 class ImageViewDialog(tk.Toplevel):
     """程序内置的图片查看窗口：不依赖 Windows 的 .png 文件关联。"""
@@ -1154,6 +1445,8 @@ class PoolCoverageApp:
         self._last_overlay_width = OVERLAY_CHOICES[0][1]
         self._last_make_video = True
         self._last_overlay_label = OVERLAY_CHOICES[0][0]
+        self._robot_seed = None       # {"frame": n, "box": [x,y,w,h]}，None=自动检测
+        self._last_seed = None
 
         self._setup_fonts()
         self._build_ui()
@@ -1338,6 +1631,23 @@ class PoolCoverageApp:
                   text="清晰度越低、越不出视频，分析越快；覆盖率/覆盖图/热力图/曲线不受影响。",
                   style="Hint.TLabel").grid(row=5, column=0, columnspan=6, sticky="w",
                                             pady=(4, 0))
+
+        # ---- 3d. 手动框选机器人（可选；不框选则自动检测）
+        ttk.Label(param_box, text="机器人框选：").grid(row=6, column=0, sticky="w",
+                                                pady=(6, 0))
+        self.var_robot_seed = tk.StringVar(value="未框选")
+        ttk.Label(param_box, textvariable=self.var_robot_seed,
+                  foreground="#b26a00").grid(row=6, column=1, sticky="w",
+                                             padx=(0, 12), pady=(6, 0))
+        self.btn_robot_seed = ttk.Button(param_box, text="框选机器人…", width=12,
+                                         command=self._choose_robot_seed)
+        self.btn_robot_seed.grid(row=6, column=2, columnspan=2, sticky="w", pady=(6, 0))
+        self.btn_robot_seed_clear = ttk.Button(param_box, text="清除框选", width=10,
+                                               state="disabled",
+                                               command=self._clear_robot_seed)
+        self.btn_robot_seed_clear.grid(row=6, column=4, sticky="w", pady=(6, 0))
+        ttk.Label(param_box, text="小目标/反光强时用", style="Hint.TLabel").grid(
+            row=6, column=5, sticky="w", pady=(6, 0))
         row += 1
 
         # ---- 4. 开始/取消 + 进度
@@ -1562,6 +1872,7 @@ class PoolCoverageApp:
         self.video_path = path
         self.var_video.set(path)
         self._clear_calibration()
+        self._reset_robot_seed()
         self._update_video_info(path)
         self._set_status("已选择视频，请完成池面标定。")
 
@@ -1745,6 +2056,51 @@ class PoolCoverageApp:
             self._set_calibrated(dialog.result)
             self._set_status("标定完成，可以点击“开始分析”。")
 
+    # -------------------------------------------------- 手动框选机器人
+    def _reset_robot_seed(self):
+        self._robot_seed = None
+        try:
+            self.var_robot_seed.set("未框选")
+            self.btn_robot_seed_clear.configure(state="disabled")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _choose_robot_seed(self):
+        if self._analyzing:
+            return
+        if core is None:
+            messagebox.showerror("无法框选", "缺少分析核心 core.py，程序不完整。")
+            return
+        if not self.video_path or not os.path.isfile(self.video_path):
+            messagebox.showinfo("请先选择视频", "请先在“1. 选择视频”里选择一个视频文件。")
+            return
+        try:
+            info = core.video_info(self.video_path)
+        except Exception as exc:
+            messagebox.showerror("读取视频失败", "无法读取视频信息：\n%s" % exc)
+            return
+        try:
+            dialog = RobotSeedDialog(self.root, self.video_path, info,
+                                     initial=self._robot_seed)
+        except Exception as exc:
+            messagebox.showerror("打开框选失败", "无法打开框选画面：\n%s" % exc)
+            return
+        self.root.wait_window(dialog)
+        if dialog.result is not None:
+            self._robot_seed = dict(dialog.result)
+            frame_index = int(self._robot_seed.get("frame", 0))
+            self.var_robot_seed.set("已框选（第 %d 帧）" % frame_index)
+            self.btn_robot_seed_clear.configure(state="normal")
+            self._set_status("已框选机器人（第 %d 帧），分析时将按模板跟踪。" % frame_index)
+
+    def _clear_robot_seed(self):
+        if self._analyzing:
+            return
+        if self._robot_seed is None:
+            return
+        self._reset_robot_seed()
+        self._set_status("已清除机器人框选，恢复自动检测。")
+
     # -------------------------------------------------- 真实时间参数校验
     def _validated_start_time(self):
         """返回 (start_time, ok)。空串表示按相对时间；非法时也给默认空串。"""
@@ -1807,6 +2163,15 @@ class PoolCoverageApp:
             sensitivity = 0.5
         overlay_width = OVERLAY_MAP.get(self.var_overlay.get(), OVERLAY_CHOICES[0][1])
         make_video = not bool(self.var_skip_video.get())
+        seed = None
+        if self._robot_seed:
+            try:
+                seed = {
+                    "frame": int(self._robot_seed.get("frame", 0)),
+                    "box": [int(round(float(v))) for v in self._robot_seed.get("box", [])],
+                }
+            except (TypeError, ValueError):
+                seed = None
         # 真实时间参数：非法也给提示，但按默认值继续（空起始时间=相对时间，倍速 1.0）
         start_time, time_ok = self._validated_start_time()
         if not time_ok:
@@ -1834,6 +2199,7 @@ class PoolCoverageApp:
         self._last_overlay_width = overlay_width
         self._last_make_video = make_video
         self._last_overlay_label = self.var_overlay.get()
+        self._last_seed = seed
         self.var_cov.set("—")
         self.var_uncovered.set("—")
         self.var_passes.set("—")
@@ -1849,7 +2215,7 @@ class PoolCoverageApp:
         self._worker = threading.Thread(
             target=self._worker_run,
             args=(video, self._calib, out_dir, target, sensitivity,
-                  start_time, speed_factor, overlay_width, make_video),
+                  start_time, speed_factor, overlay_width, make_video, seed),
             name="PoolCoverageAnalyze",
             daemon=True,
         )
@@ -1873,7 +2239,7 @@ class PoolCoverageApp:
         return out_dir
 
     def _worker_run(self, video, calib, out_dir, target, sensitivity,
-                    start_time, speed_factor, overlay_width, make_video):
+                    start_time, speed_factor, overlay_width, make_video, seed):
         """后台线程：只调用 core，不碰任何 Tk 控件，全部结果走 queue。"""
         try:
             result = core.analyze(
@@ -1886,6 +2252,7 @@ class PoolCoverageApp:
                 speed_factor=speed_factor,
                 overlay_width=overlay_width,
                 make_video=make_video,
+                seed=seed,
             )
             self._queue.put(("result", result))
         except BaseException as exc:  # noqa: BLE001 - 线程里必须兜住一切
@@ -1977,6 +2344,9 @@ class PoolCoverageApp:
             notes.append("轨迹视频：%s" % self._last_overlay_label)
         else:
             notes.append("轨迹视频：已按设置跳过生成（提速）")
+        if self._last_seed:
+            notes.append("机器人框选：已使用第 %d 帧的手动框选做模板跟踪"
+                         % int(self._last_seed.get("frame", 0)))
         warnings = list(getattr(result, "warnings", []) or [])
         if warnings:
             notes.append("提示：" + "；".join(str(w) for w in warnings))
@@ -2023,8 +2393,13 @@ class PoolCoverageApp:
         state = "disabled" if analyzing else "normal"
         for widget in (self.btn_browse, self.rb_rect, self.rb_ellipse, self.rb_poly,
                        self.btn_calibrate, self.btn_start,
-                       self.btn_choose_out, self.btn_reset_out, self.chk_skip_video):
+                       self.btn_choose_out, self.btn_reset_out, self.chk_skip_video,
+                       self.btn_robot_seed):
             widget.configure(state=state)
+        if analyzing or self._robot_seed is None:
+            self.btn_robot_seed_clear.configure(state="disabled")
+        else:
+            self.btn_robot_seed_clear.configure(state="normal")
         for widget in (self.btn_tpl_apply, self.btn_tpl_save, self.btn_tpl_delete):
             widget.configure(state=state)
         self.combo_template.configure(state="disabled" if analyzing else "readonly")

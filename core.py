@@ -22,7 +22,7 @@ try:
 except Exception:  # pragma: no cover
     Image = ImageDraw = ImageFont = None
 
-VERSION = "0.5.4"
+VERSION = "0.7.0"
 SHAPE_RECT = "rect"
 SHAPE_ELLIPSE = "ellipse"
 SHAPE_POLY = "poly"
@@ -487,13 +487,14 @@ def auto_calibrate(path, shape=SHAPE_RECT):
 
 
 # ---------------------------------------------------------------- 检测
-def _detect_candidates(gray, bg_gray, roi, mode, thr, pool_area, kern):
+def _detect_candidates(gray, bg_gray, roi, mode, thr, pool_area, kern,
+                       amin_ratio=MIN_DET_RATIO, amax_ratio=MAX_DET_RATIO):
     diff = cv2.absdiff(gray, bg_gray)
     base = ((diff > thr) & (roi > 0)).astype(np.uint8) * 255
     cond = (gray < 115) if mode != "bright" else (gray > 190)
     conds = [cond]
-    amin = max(80, int(pool_area * MIN_DET_RATIO))
-    amax = max(amin * 4, int(pool_area * MAX_DET_RATIO))
+    amin = max(24, int(pool_area * amin_ratio))
+    amax = max(amin * 6, int(pool_area * amax_ratio))
     out = []
     for cond in conds:
         m = (base > 0).astype(np.uint8) & cond.astype(np.uint8)
@@ -514,8 +515,10 @@ def _detect_candidates(gray, bg_gray, roi, mode, thr, pool_area, kern):
             fill = a / float(w * h)
             if fill < 0.25:
                 continue
+            dia = math.sqrt(float(w) * float(h))
             out.append({"cx": x + w / 2.0, "cy": y + h / 2.0, "w": float(w),
-                        "h": float(h), "area": float(a), "fill": float(fill)})
+                        "h": float(h), "area": float(a), "fill": float(fill),
+                        "_dia": dia})
     out.sort(key=lambda d: -d["area"])
     return out
 
@@ -541,6 +544,214 @@ def _estimate_robot_area(cap, bg_gray, roi, mode, thr, pool_area, kern, n_frames
     if not areas:
         return None
     return float(np.median(areas))
+
+
+def _template_track(video_path, seed, n_frames, fps, pool_mask, progress, cancel,
+                    sensitivity=0.5, p0=0.05, p1=0.75):
+    """手动框选一次机器人，之后用模板匹配逐帧跟踪（适合小目标/浅色/反光干扰大的机位）。
+    seed: {"frame": 帧号, "box": [x, y, w, h]}（原视频像素坐标）"""
+    frame_idx = int(seed.get("frame", 0))
+    bx, by, bw, bh = [int(round(v)) for v in seed.get("box", [])]
+    if bw < 6 or bh < 6:
+        raise RuntimeError("框选的机器人区域太小，请重新框选")
+    info = video_info(video_path)
+    vw, vh = info["width"], info["height"]
+    bx = max(0, min(bx, vw - bw)); by = max(0, min(by, vh - bh))
+    seed_frame = probe_frame(video_path, frame_idx)
+    gray0 = cv2.cvtColor(seed_frame, cv2.COLOR_BGR2GRAY)
+    template = gray0[by:by + bh, bx:bx + bw].copy()
+    if float(template.std()) < 4.0:
+        raise RuntimeError("框选区域几乎没有纹理，请把机器人完整框进去")
+    try:
+        sens = max(0.0, min(1.0, float(sensitivity)))
+    except (TypeError, ValueError):
+        sens = 0.5
+    thr = 0.62 - 0.22 * sens
+    margin = int(max(bw, bh) * 1.5) + 8
+    dets = [None] * n_frames
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("无法打开视频文件")
+    # 搜索范围限制在池面附近，避免匹配到池外的白墙/设备
+    pad = int(0.01 * max(vw, vh)) + max(bw, bh)
+    roi = cv2.dilate(pool_mask, np.ones((pad), np.uint8))
+    prev = (float(bx + bw / 2.0), float(by + bh / 2.0))
+    vel = (0.0, 0.0)
+    miss = 0
+    last_k = None
+    for k in range(n_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if k < frame_idx:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        found = None
+        px = int(round(prev[0] + vel[0])); py = int(round(prev[1] + vel[1]))
+        x0 = max(0, px - margin - bw // 2); x1 = min(vw, px + margin + bw // 2 + 1)
+        y0 = max(0, py - margin - bh // 2); y1 = min(vh, py + margin + bh // 2 + 1)
+        if x1 - x0 >= bw and y1 - y0 >= bh:
+            crop = gray[y0:y1, x0:x1]
+            res = cv2.matchTemplate(crop, template, cv2.TM_CCOEFF_NORMED)
+            _, mx, _, mloc = cv2.minMaxLoc(res)
+            if mx >= thr:
+                cx = x0 + mloc[0] + bw / 2.0
+                cy = y0 + mloc[1] + bh / 2.0
+                found = (cx, cy, float(mx))
+        if found is None and miss >= 8:
+            # 跟丢后整池搜索一次（阈值略高，避免乱匹配）
+            ys, xs = np.where(roi > 0)
+            if len(xs):
+                x0, x1 = int(xs.min()), int(xs.max()) + 1
+                y0, y1 = int(ys.min()), int(ys.max()) + 1
+                crop = gray[y0:y1, x0:x1]
+                if crop.shape[0] >= bh and crop.shape[1] >= bw:
+                    res = cv2.matchTemplate(crop, template, cv2.TM_CCOEFF_NORMED)
+                    _, mx, _, mloc = cv2.minMaxLoc(res)
+                    mask_patch = cv2.resize(roi[y0:y1, x0:x1], (res.shape[1], res.shape[0]),
+                                            interpolation=cv2.INTER_NEAREST) > 0
+                    if mx >= thr + 0.08 and mask_patch[mloc[1], mloc[0]]:
+                        found = (x0 + mloc[0] + bw / 2.0, y0 + mloc[1] + bh / 2.0, float(mx))
+        if found is not None:
+            cx, cy, score = found
+            if last_k is not None and k - last_k > 0:
+                vel = (0.5 * vel[0] + 0.5 * (cx - prev[0]) / (k - last_k),
+                       0.5 * vel[1] + 0.5 * (cy - prev[1]) / (k - last_k))
+            dets[k] = {"cx": float(cx), "cy": float(cy), "w": float(bw), "h": float(bh),
+                       "area": float(bw * bh), "fill": 1.0,
+                       "_dia": math.sqrt(float(bw * bh))}
+            prev = (cx, cy); last_k = k; miss = 0
+            if score >= 0.80 and k % 4 == 0:   # 高分时缓慢更新模板，适应旋转/水光
+                nx = int(round(cx - bw / 2.0)); ny = int(round(cy - bh / 2.0))
+                if 0 <= nx and 0 <= ny and nx + bw <= vw and ny + bh <= vh:
+                    patch = gray[ny:ny + bh, nx:nx + bw].copy()
+                    if float(patch.std()) > 3.0:
+                        template = cv2.addWeighted(template, 0.7, patch, 0.3, 0)
+        else:
+            miss += 1
+            if miss >= 40:
+                prev = (prev[0] + vel[0] * 40, prev[1] + vel[1] * 40)
+                vel = (0.0, 0.0)
+        if miss > 90:
+            break
+        if k % 10 == 0:
+            _check_cancel(cancel)
+            _progress(progress, p0 + (p1 - p0) * k / max(1, n_frames),
+                      "模板跟踪机器人… 第 %d/%d 帧" % (k, n_frames))
+    cap.release()
+    return dets
+
+
+def _gather_candidates(video_path, bg_gray, roi, modes, thr, pool_area, kern,
+                       n_frames, stride, progress, cancel, p0, p1):
+    """逐帧收集所有候选目标（不做“锁定”），供后面多轨迹选择用"""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("无法打开视频文件")
+    out = [None] * n_frames
+    for k in range(n_frames):
+        if stride > 1 and (k % stride):
+            if not cap.grab():
+                break
+            if k % 30 == 0:
+                _progress(progress, p0 + (p1 - p0) * k / max(1, n_frames),
+                          "检测机器人… 第 %d/%d 帧" % (k, n_frames))
+            continue
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if bg_gray.shape[1] != frame.shape[1]:
+            frame = cv2.resize(frame, (bg_gray.shape[1], bg_gray.shape[0]),
+                               interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        cands = []
+        for mode in modes:
+            cands.extend(_detect_candidates(gray, bg_gray, roi, mode, thr, pool_area, kern,
+                                            amin_ratio=0.00006, amax_ratio=0.06))
+        out[k] = cands
+        if k % 10 == 0:
+            _check_cancel(cancel)
+            _progress(progress, p0 + (p1 - p0) * k / max(1, n_frames),
+                      "检测机器人… 第 %d/%d 帧" % (k, n_frames))
+    cap.release()
+    return out
+
+
+def _select_robot_track(cands_per_frame, n_frames):
+    """多轨迹跟踪：把候选连成若干条轨迹，挑“命中多、尺寸稳定、确实在移动”的那条当机器人。
+    反光/水花一般原地闪烁（位移很小），会被移动距离条件筛掉。"""
+    max_gap = 12
+    tracks = []
+    for k in range(n_frames):
+        cands = cands_per_frame[k] or []
+        if cands:
+            for t in tracks:
+                t["_assigned"] = None
+            for c in cands:
+                best, best_d = None, None
+                for t in tracks:
+                    if t["_assigned"] is not None:
+                        continue
+                    if k - t["last_k"] > max_gap:
+                        continue
+                    med = t["med"]
+                    if med > 0 and not (0.3 * med <= c["_dia"] <= 3.3 * med):
+                        continue
+                    d = math.hypot(c["cx"] - t["x"], c["cy"] - t["y"])
+                    if d > max(24.0, 3.0 * med):
+                        continue
+                    if best_d is None or d < best_d:
+                        best, best_d = t, d
+                if best is not None:
+                    best["_assigned"] = c
+                    best["pts"].append((k, c))
+                    best["hits"] += 1
+                    best["last_k"] = k
+                    best["x"], best["y"] = c["cx"], c["cy"]
+                    best["sizes"].append(c["_dia"])
+                    if len(best["sizes"]) > 30:
+                        best["sizes"].pop(0)
+                    best["med"] = float(np.median(best["sizes"]))
+                else:
+                    tracks.append({"hits": 1, "pts": [(k, c)], "last_k": k,
+                                   "x": c["cx"], "y": c["cy"],
+                                   "sizes": [c["_dia"]], "med": c["_dia"],
+                                   "_assigned": c})
+        # 定期清理长时间未更新的轨迹
+        if k % 30 == 0 and len(tracks) > 400:
+            tracks = [t for t in tracks if k - t["last_k"] <= max_gap]
+    if not tracks:
+        return [None] * n_frames, None
+    best = None
+    for t in tracks:
+        pts = t["pts"]
+        if t["hits"] < 3:
+            continue
+        span = max(1, pts[-1][0] - pts[0][0] + 1)
+        hit_rate = t["hits"] / float(span)
+        path = 0.0
+        for (k1, c1), (k2, c2) in zip(pts[:-1], pts[1:]):
+            if k2 - k1 <= max_gap:
+                path += math.hypot(c2["cx"] - c1["cx"], c2["cy"] - c1["cy"])
+        t["path"] = path
+        sizes = np.asarray(t["sizes"], dtype=float)
+        med = float(np.median(sizes)) if len(sizes) else 0.0
+        size_cv = float(sizes.std() / med) if med > 0 else 9.0
+        ok_moving = path >= 2.0 * max(1.0, med)
+        ok_hits = t["hits"] >= max(6, int(0.05 * n_frames))
+        if not (ok_moving and ok_hits):
+            continue
+        # 命中率高、尺寸稳定、移动里程长为佳
+        score = hit_rate * (t["hits"] ** 0.25) + path / max(1.0, med) - 1.2 * size_cv
+        if best is None or score > best[0]:
+            best = (score, t)
+    if best is None:
+        return [None] * n_frames, None
+    track = best[1]
+    dets = [None] * n_frames
+    for k, c in track["pts"]:
+        dets[k] = c
+    return dets, track
 
 
 def _pick_candidate(cands, prev, gate, size_ref, pred=None):
@@ -655,18 +866,22 @@ def _resample_polyline(points, step):
     return out
 
 
-def _runs_from_detections(dets, gap_max):
-    """把检测点按“相邻检测间隔不超过 gap_max 帧”切成若干段轨迹。
-    注意：跳帧检测时中间会夹着空帧，不能把空帧当成轨迹结束。"""
+def _runs_from_detections(dets, gap_max, jump_factor=4.0):
+    """把检测点按“相邻检测间隔不超过 gap_max 帧、且位移不超过 N 个机身”切成若干段轨迹。
+    注意：跳帧/加速视频里，两帧之间机器人可能已经走出很远，不能盲目连线。"""
     runs, cur, last_k = [], [], None
     for k in range(len(dets)):
         d = dets[k]
         if d is None:
             continue
-        if cur and (k - last_k) > gap_max:
-            if len(cur) > 1:
-                runs.append(cur)
-            cur = []
+        if cur:
+            pd = cur[-1]
+            dia = math.sqrt(max(1.0, float(d.get("w", 1.0)) * float(d.get("h", 1.0))))
+            dist = math.hypot(d["cx"] - pd[1], d["cy"] - pd[2])
+            if (k - last_k) > gap_max or dist > jump_factor * max(1.0, dia):
+                if len(cur) > 1:
+                    runs.append(cur)
+                cur = []
         cur.append((k, d["cx"], d["cy"]))
         last_k = k
     if len(cur) > 1:
@@ -987,8 +1202,11 @@ def _render_overlay(video_path, dets, n_frames, fps, vw, vh, calib, curve,
             y2p = int((d["cy"] + d["h"] / 2) * sx)
             cv2.rectangle(vis, (x1p, y1p), (x2p, y2p), (0, 255, 0), 2)
             pt = (int(d["cx"] * sx), int(d["cy"] * sx))
-            if trail_prev is not None and (k - trail_last_k) <= max(GAP_FRAMES_MAX, stride * 2):
-                cv2.line(trail_mask, trail_prev, pt, 255, 3, cv2.LINE_AA)
+            if trail_prev is not None:
+                dia = math.sqrt(max(1.0, d["w"] * d["h"])) * sx
+                far = math.hypot(pt[0] - trail_prev[0], pt[1] - trail_prev[1]) > 4.0 * max(6.0, dia)
+                if (k - trail_last_k) <= max(GAP_FRAMES_MAX, stride * 2) and not far:
+                    cv2.line(trail_mask, trail_prev, pt, 255, 3, cv2.LINE_AA)
             if trail_prev is None:
                 cv2.circle(start_mask, pt, 7, 255, -1)
             trail_prev, trail_last_k = pt, k
@@ -1037,7 +1255,7 @@ def _render_overlay(video_path, dets, n_frames, fps, vw, vh, calib, curve,
 
 def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
             progress=None, cancel=None, overlay_width=1280, make_video=True,
-            start_time=None, speed_factor=1.0):
+            start_time=None, speed_factor=1.0, seed=None):
     if target not in ("auto", "dark", "bright"):
         raise ValueError("未知目标类型：%s" % target)
     if not os.path.isfile(video_path):
@@ -1083,133 +1301,78 @@ def analyze(video_path, calib, out_dir, *, target="auto", sensitivity=0.5,
     sens = min(1.0, max(0.0, float(sensitivity)))
     thr = int(round(28 - 26 * sens))
 
-    # 加速模式：大分辨率画面先把检测降采样到一半；长视频再隔帧检测
-    det_scale = 0.5 if max(vw, vh) >= 1600 else 1.0
-    stride = 2 if (fps >= 25 and n_frames >= 600) else 1
-    dw = int(round(vw * det_scale)); dh = int(round(vh * det_scale))
-    if det_scale != 1.0:
-        roi_det = cv2.resize(roi, (dw, dh), interpolation=cv2.INTER_NEAREST)
-        pool_det = cv2.resize(pool_mask, (dw, dh), interpolation=cv2.INTER_NEAREST)
-        pool_area_det = int(np.count_nonzero(pool_det))
-        s2 = min(dw, dh) / 1080.0
-        kern_det = {
-            "open": np.ones((_odd(5 * max(s2, 0.5)), _odd(5 * max(s2, 0.5))), np.uint8),
-            "close": np.ones((_odd(25 * max(s2, 0.5)), _odd(25 * max(s2, 0.5))), np.uint8),
-        }
+    det_scale = 0.5 if max(vw, vh) >= 2560 else 1.0
+    stride = 2 if n_frames >= 1500 else 1
+    if seed:
+        # 手动框选模式：用模板跟踪（适合小目标/浅色/反光干扰大的机位）
+        warnings = []
+        if start_time and start_sec is None:
+            warnings.append("起始时间格式不正确（应为 HH:MM:SS），曲线图按相对时间显示。")
+        _progress(progress, 0.04, "模板跟踪机器人…")
+        dets = _template_track(video_path, seed, n_frames, fps, pool_mask, progress, cancel,
+                               sensitivity=sens, p0=0.06, p1=0.66)
+        detected = sum(1 for d in dets if d is not None)
+        warnings.append("已使用手动框选模板跟踪（第 %d 帧框选）。" % int(seed.get("frame", 0)))
+        if detected < 5:
+            raise RuntimeError("模板跟踪没有跟上机器人：请重新框选（框住机器人本体、选机器人清晰的一帧）。")
     else:
-        roi_det, pool_area_det, kern_det = roi, pool_area, kern
-    _progress(progress, 0.0, "读取视频背景…")
-    # 背景：均匀抽帧取中值
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError("无法打开视频文件")
-    n_bg = int(min(61, max(9, n_frames)))
-    idxs = np.linspace(0, max(0, n_frames - 1), n_bg).astype(int)
-    frames_bg = []
-    for i in idxs:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
-        ok, fr = cap.read()
-        if ok and fr is not None:
-            if det_scale != 1.0:
-                fr = cv2.resize(fr, (dw, dh), interpolation=cv2.INTER_AREA)
-            frames_bg.append(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY))
-    if not frames_bg:
-        cap.release()
-        raise RuntimeError("无法读取视频帧")
-    bg_gray = np.median(np.stack(frames_bg), axis=0).astype(np.uint8)
+        # 检测分辨率：只有 2K/4K 画面才降采样；1080p 保持全分辨率（小目标需要）
+        dw = int(round(vw * det_scale)); dh = int(round(vh * det_scale))
+        if det_scale != 1.0:
+            roi_det = cv2.resize(roi, (dw, dh), interpolation=cv2.INTER_NEAREST)
+            pool_det = cv2.resize(pool_mask, (dw, dh), interpolation=cv2.INTER_NEAREST)
+            pool_area_det = int(np.count_nonzero(pool_det))
+            s2 = min(dw, dh) / 1080.0
+            kern_det = {
+                "open": np.ones((_odd(5 * max(s2, 0.5)), _odd(5 * max(s2, 0.5))), np.uint8),
+                "close": np.ones((_odd(25 * max(s2, 0.5)), _odd(25 * max(s2, 0.5))), np.uint8),
+            }
+        else:
+            roi_det, pool_area_det, kern_det = roi, pool_area, kern
 
-    # 第一遍：逐帧检测 + 跟踪
-    warnings = []
-    if det_scale != 1.0 or stride > 1:
-        warnings.append("已启用快速模式：检测分辨率 ×%.2f、隔 %d 帧检测（不影响覆盖率统计口径）。"
-                        % (det_scale, stride))
-    if start_time and start_sec is None:
-        warnings.append("起始时间格式不正确（应为 HH:MM:SS），曲线图按相对时间显示。")
-    gate = 0.15 * math.hypot(vw, vh)
-
-    def run_track_pass(mode, p0=0.05, p1=0.60, size_hint=None):
-        cap2 = cv2.VideoCapture(video_path)
-        if not cap2.isOpened():
+        _progress(progress, 0.0, "读取视频背景…")
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
             raise RuntimeError("无法打开视频文件")
-        dets_local = [None] * n_frames
-        prev, prev2 = None, None
-        size_ref = [size_hint] * 8 if size_hint else []
-        misses = 0
-        cnt = 0
-        for k in range(n_frames):
-            if stride > 1 and (k % stride):
-                if not cap2.grab():
-                    break
-                if k % 30 == 0:
-                    _progress(progress, p0 + (p1 - p0) * k / max(1, n_frames),
-                              "检测机器人… 第 %d/%d 帧" % (k, n_frames))
-                continue
-            ok, frame = cap2.read()
-            if not ok:
-                break
-            if det_scale != 1.0:
-                frame = cv2.resize(frame, (dw, dh), interpolation=cv2.INTER_AREA)
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            cands = _detect_candidates(gray, bg_gray, roi_det, mode, thr, pool_area_det, kern_det)
-            if det_scale != 1.0:
-                inv = 1.0 / det_scale
-                for c in cands:
-                    c["cx"] *= inv; c["cy"] *= inv
-                    c["w"] *= inv; c["h"] *= inv
-                    c["area"] *= inv * inv
-            pred = None
-            if prev is not None:
-                if prev2 is not None:
-                    pred = {"cx": 2 * prev["cx"] - prev2["cx"],
-                            "cy": 2 * prev["cy"] - prev2["cy"]}
-                else:
-                    pred = prev
-            chosen = _pick_candidate(cands, prev, gate, size_ref, pred)
-            if chosen is not None:
-                dets_local[k] = chosen
-                prev2, prev = prev, chosen
-                size_ref.append(chosen["area"])
-                if len(size_ref) > 60:
-                    size_ref.pop(0)
-                cnt += 1
-                misses = 0
-            else:
-                misses += 1
-                if misses >= 30:          # 连续漏检：允许重新捕获
-                    prev, prev2 = None, None
-            if k % 10 == 0:
-                _check_cancel(cancel)
-                _progress(progress, p0 + (p1 - p0) * k / max(1, n_frames),
-                          "检测机器人… 第 %d/%d 帧" % (k, n_frames))
-        cap2.release()
-        return dets_local, cnt
+        n_bg = int(min(61, max(9, n_frames)))
+        idxs = np.linspace(0, max(0, n_frames - 1), n_bg).astype(int)
+        frames_bg = []
+        for i in idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+            ok, fr = cap.read()
+            if ok and fr is not None:
+                if det_scale != 1.0:
+                    fr = cv2.resize(fr, (dw, dh), interpolation=cv2.INTER_AREA)
+                frames_bg.append(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY))
+        cap.release()
+        if not frames_bg:
+            raise RuntimeError("无法读取视频帧")
+        bg_gray = np.median(np.stack(frames_bg), axis=0).astype(np.uint8)
 
-    _progress(progress, 0.04, "估计机器人尺寸…")
-    cap_hint = cv2.VideoCapture(video_path)
-    hint_mode = "dark" if target in ("auto", "dark") else "bright"
-    size_hint = _estimate_robot_area(cap_hint, bg_gray, roi_det, hint_mode, thr,
-                                     pool_area_det, kern_det, n_frames, det_scale=det_scale)
-    cap_hint.release()
-    print("机器人尺寸估计(px^2):", size_hint)
+        warnings = []
+        if det_scale != 1.0 or stride > 1:
+            warnings.append("已启用加速模式：检测分辨率 ×%.2f、隔 %d 帧检测（不影响覆盖率统计口径）。"
+                            % (det_scale, stride))
+        if start_time and start_sec is None:
+            warnings.append("起始时间格式不正确（应为 HH:MM:SS），曲线图按相对时间显示。")
 
-    if target == "auto":
-        _progress(progress, 0.06, "检测机器人（暗色目标）…")
-        dets, detected = run_track_pass("dark", 0.06, 0.55, size_hint)
-        if detected < 0.25 * n_frames:
-            _progress(progress, 0.06, "暗色目标较少，尝试亮色目标…")
-            cap_hint2 = cv2.VideoCapture(video_path)
-            hint2 = _estimate_robot_area(cap_hint2, bg_gray, roi_det, "bright", thr,
-                                         pool_area_det, kern_det, n_frames, det_scale=det_scale)
-            cap_hint2.release()
-            dets2, detected2 = run_track_pass("bright", 0.10, 0.60, hint2)
-            if detected2 > detected:
-                dets, detected = dets2, detected2
-                warnings.append("已自动切换为亮色目标检测。")
-    else:
-        dets, detected = run_track_pass(target, 0.06, 0.60, size_hint)
-    _check_cancel(cancel)
-    if detected < 5:
-        raise RuntimeError("未检测到机器人。可调高灵敏度、切换目标类型，或检查池面标定是否准确。")
+        if target == "dark":
+            modes = ["dark"]
+        elif target == "bright":
+            modes = ["bright"]
+        else:
+            modes = ["dark", "bright"]
+        _progress(progress, 0.04, "检测目标（多轨迹跟踪）…")
+        cands_all = _gather_candidates(video_path, bg_gray, roi_det, modes, thr, pool_area_det,
+                                       kern_det, n_frames, stride, progress, cancel, 0.06, 0.58)
+        dets, robot_track = _select_robot_track(cands_all, n_frames)
+        detected = sum(1 for d in dets if d is not None)
+        if detected < 5:
+            raise RuntimeError("未检测到机器人。可调高灵敏度、切换目标类型，或检查池面标定是否准确。")
+        if detected < 0.15 * n_frames:
+            warnings.append("机器人可见帧数较少（%d/%d），覆盖率可能偏低；可调高灵敏度或改用亮色/暗色目标类型。"
+                            % (detected, n_frames))
+
 
     # 第二遍：像素覆盖率（栅格近似）
     _progress(progress, 0.62, "计算覆盖面积…")
