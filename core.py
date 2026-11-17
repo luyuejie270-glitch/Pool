@@ -22,7 +22,7 @@ try:
 except Exception:  # pragma: no cover
     Image = ImageDraw = ImageFont = None
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 SHAPE_RECT = "rect"
 SHAPE_ELLIPSE = "ellipse"
 SHAPE_POLY = "poly"
@@ -643,7 +643,7 @@ def _template_track(video_path, seed, n_frames, fps, pool_mask, progress, cancel
 
 
 def _gather_candidates(video_path, bg_gray, roi, modes, thr, pool_area, kern,
-                       n_frames, stride, progress, cancel, p0, p1):
+                       n_frames, stride, progress, cancel, p0, p1, pool_mask=None):
     """逐帧收集所有候选目标（不做“锁定”），供后面多轨迹选择用"""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -668,6 +668,15 @@ def _gather_candidates(video_path, bg_gray, roi, modes, thr, pool_area, kern,
         for mode in modes:
             cands.extend(_detect_candidates(gray, bg_gray, roi, mode, thr, pool_area, kern,
                                             amin_ratio=0.00006, amax_ratio=0.06))
+        if pool_mask is not None and cands:
+            # 只保留中心落在标定池面内部的候选：池边/池外的固定物体直接排除
+            h, w = pool_mask.shape[:2]
+            keep = []
+            for c in cands:
+                x = int(round(c["cx"])); y = int(round(c["cy"]))
+                if 0 <= x < w and 0 <= y < h and pool_mask[y, x] > 0:
+                    keep.append(c)
+            cands = keep
         out[k] = cands
         if k % 10 == 0:
             _check_cancel(cancel)
