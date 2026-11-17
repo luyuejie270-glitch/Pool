@@ -154,3 +154,15 @@ core.analyze(video, calib, out_dir, *, target="auto", sensitivity=0.5,
     返回记录含 `curve`（约 200 点）、`avg_passes`、`overlay_path`、`coverage_path`、
     `heatmap_path`、`curve_path`、`trajectory_image_path`、`created`、`shape` 等。
 - 输出目录完全由 GUI 决定（core 只往传入的 out_dir 写文件）。
+
+## 阶段5（v0.7.0）手动框选模板跟踪
+
+```python
+core.analyze(video, calib, out_dir, ..., seed=None)
+# seed = {"frame": 帧号(int), "box": [x, y, w, h]}   # 原视频像素坐标，框住机器人本体
+# 传 seed 时：不再跑通用检测，改用模板匹配逐帧跟踪（适合小目标/浅色/反光强的机位）
+# 不传 seed 时：行为与 v0.6.0 完全一致
+```
+
+GUI 侧：主窗口参数区「机器人框选」行（框选机器人… / 清除框选 / 状态），
+RobotSeedDialog 支持帧滑杆 + 拖拽画框，返回 seed dict 传给 analyze。
