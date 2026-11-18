@@ -22,7 +22,7 @@ try:
 except Exception:  # pragma: no cover
     Image = ImageDraw = ImageFont = None
 
-VERSION = "0.7.2"
+VERSION = "0.7.3"
 SHAPE_RECT = "rect"
 SHAPE_ELLIPSE = "ellipse"
 SHAPE_POLY = "poly"
@@ -669,8 +669,11 @@ def _gather_candidates(video_path, bg_gray, roi, modes, thr, pool_area, kern,
             cands.extend(_detect_candidates(gray, bg_gray, roi, mode, thr, pool_area, kern,
                                             amin_ratio=0.00006, amax_ratio=0.06))
         if pool_mask is not None and cands:
-            # 候选框至少有 25% 落在标定池面内才算（允许机器人贴边，排除池外的固定物体）
+            # 候选框与“池面（外扩一点）”有重叠才算；既能排除池外的固定物体，
+            # 又不会把贴着池壁走的机器人误删（标定偏内时尤其重要）。
             h, w = pool_mask.shape[:2]
+            pad = max(5, int(round(0.02 * min(h, w))))
+            mask_soft = cv2.dilate(pool_mask, np.ones((pad * 2 + 1, pad * 2 + 1), np.uint8))
             keep = []
             for c in cands:
                 x1 = max(0, int(round(c["cx"] - c["w"] / 2.0)))
@@ -679,8 +682,8 @@ def _gather_candidates(video_path, bg_gray, roi, modes, thr, pool_area, kern,
                 y2 = min(h, int(round(c["cy"] + c["h"] / 2.0)) + 1)
                 if x2 <= x1 or y2 <= y1:
                     continue
-                inside = int(np.count_nonzero(pool_mask[y1:y2, x1:x2]))
-                if inside >= 0.25 * float((x2 - x1) * (y2 - y1)):
+                inside = int(np.count_nonzero(mask_soft[y1:y2, x1:x2]))
+                if inside >= 0.12 * float((x2 - x1) * (y2 - y1)):
                     keep.append(c)
             cands = keep
         out[k] = cands

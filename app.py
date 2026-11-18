@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""泳池机器人覆盖率分析 v0.7.2 —— Tkinter 桌面界面。
+"""泳池机器人覆盖率分析 v0.7.3 —— Tkinter 桌面界面。
 
 分析算法在 core.py（接口契约见 INTERFACE.md）。本模块遵守两条硬约束：
 
@@ -32,7 +32,7 @@ try:  # 缺少 core.py 时也允许 import 成功，main() 会给出中文提示
 except Exception:  # pragma: no cover - 仅在文件缺失/依赖损坏时触发
     core = None
 
-APP_TITLE = "泳池机器人覆盖率分析 v0.7.2"
+APP_TITLE = "泳池机器人覆盖率分析 v0.7.3"
 MIN_WINDOW_WIDTH = 900
 MIN_WINDOW_HEIGHT = 680
 
